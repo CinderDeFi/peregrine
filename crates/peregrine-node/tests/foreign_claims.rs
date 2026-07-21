@@ -232,3 +232,105 @@ fn a_node_without_anchors_accepts_nothing() {
         .apply_foreign_claim(&native_claim(MAINNET, [0x42; 32]))
         .is_err());
 }
+
+// ── consensus safety: bounding proof-verification work ──────────────────────
+
+/// Proof verification is orders of magnitude costlier than anything else on the
+/// commit path, so a vertex stuffed with claims must not be able to halt
+/// consensus. The budget caps it.
+#[test]
+fn verification_work_is_bounded_per_commit() {
+    use peregrine_node::pipeline::MAX_CLAIMS_PER_COMMIT;
+
+    let mut pipeline = anchored_pipeline(Box::new(NativeVerifier));
+
+    // Distinct claims so nothing is deduplicated by accident.
+    let mut accepted = 0;
+    let mut refused = 0;
+    for i in 0..(MAX_CLAIMS_PER_COMMIT + 3) {
+        let mut value = [0u8; 32];
+        value[31] = i as u8;
+        match pipeline.apply_foreign_claim(&native_claim(MAINNET, value)) {
+            Ok(_) => accepted += 1,
+            Err(e) => {
+                assert!(e.contains("budget exhausted"), "unexpected refusal: {e}");
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(
+        accepted, MAX_CLAIMS_PER_COMMIT,
+        "exactly the budget is honoured"
+    );
+    assert_eq!(refused, 3, "the rest are refused, not silently dropped");
+}
+
+/// The budget must be *deterministic*: two validators replaying the same
+/// committed order must accept exactly the same claims, or they fork.
+#[test]
+fn the_budget_is_deterministic_across_validators() {
+    use peregrine_node::pipeline::MAX_CLAIMS_PER_COMMIT;
+
+    let claims: Vec<_> = (0..(MAX_CLAIMS_PER_COMMIT + 2))
+        .map(|i| {
+            let mut v = [0u8; 32];
+            v[31] = i as u8;
+            native_claim(MAINNET, v)
+        })
+        .collect();
+
+    let run = || {
+        let mut p = anchored_pipeline(Box::new(NativeVerifier));
+        let outcomes: Vec<bool> = claims
+            .iter()
+            .map(|c| p.apply_foreign_claim(c).is_ok())
+            .collect();
+        (outcomes, p.store_root())
+    };
+
+    let (outcomes_a, root_a) = run();
+    let (outcomes_b, root_b) = run();
+    assert_eq!(
+        outcomes_a, outcomes_b,
+        "same order must give the same decisions"
+    );
+    assert_eq!(root_a, root_b, "and therefore the same state root");
+}
+
+/// A build without a proving backend must refuse ZK claims outright — the
+/// fail-closed default that keeps an unverifiable claim from being applied.
+#[test]
+fn a_node_without_a_backend_refuses_zk_claims() {
+    use peregrine_node::pipeline::ClaimPolicy;
+
+    let mut pipeline = ExecutionPipeline::new();
+    pipeline.claim_policy = ClaimPolicy::strict([0xAA; 32], MAINNET);
+    pipeline
+        .anchors
+        .insert(Anchor {
+            slot: 1,
+            block_number: 21_000_000,
+            block_hash: ANCHORED_BLOCK,
+            state_root: [0x22; 32],
+        })
+        .unwrap();
+
+    let zk = VerifiedClaim {
+        journal: storage_journal(MAINNET, [0x42; 32]),
+        proof: Proof::Zk {
+            system: ProofSystem::Sp1,
+            image_id: [0xAA; 32], // correct image, but nothing can check it
+            bytes: vec![1, 2, 3],
+        },
+    };
+    let err = pipeline.apply_foreign_claim(&zk).unwrap_err();
+    assert!(
+        err.contains("not wired up") || err.contains("Sp1"),
+        "expected an unsupported-backend refusal, got: {err}"
+    );
+
+    // And a native claim is refused for the other reason: no cryptography.
+    assert!(pipeline
+        .apply_foreign_claim(&native_claim(MAINNET, [0x42; 32]))
+        .is_err());
+}

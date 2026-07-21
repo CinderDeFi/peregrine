@@ -18,7 +18,11 @@ bls = ["dep:blst"]
 
 [dependencies]
 peregrine-core.workspace = true
-peregrine-data.workspace = true
+# Declared by path rather than `workspace = true` on purpose: Cargo **ignores**
+# `default-features = false` on an inherited workspace dependency unless the
+# workspace entry also sets it, so inheritance would silently pull `streams` ->
+# tokio -> mio, which cannot compile for the zkVM guest target.
+peregrine-data = { path = "../peregrine-data", default-features = false }
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true
@@ -30,11 +34,15 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 # not keccak). SP1 ships an accelerated patch for this crate.
 sha2 = "0.10"
 # Host-side proving. Optional: see the `sp1` feature above.
-sp1-sdk = { version = "6.3", optional = true }
+# `blocking`: SP1 v6's default client is async; the node's verifier path is
+# synchronous, and a blocking client keeps proof verification out of the
+# async runtime entirely.
+sp1-sdk = { version = "6.3", optional = true, features = ["blocking"] }
 # Ethereum's reference BLS library (min_pk: G1 keys, G2 signatures).
 blst = { version = "0.3", optional = true }
 
 [dev-dependencies]
+anyhow.workspace = true
 serde_json = "1"
 hex.workspace = true
 rand.workspace = true

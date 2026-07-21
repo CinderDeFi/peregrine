@@ -281,8 +281,27 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
         while let Ok(m) = cfg.inbox.rx.try_recv() {
             msg_buf.push(m);
         }
-        while let Ok(more) = cfg.ingest_rx.try_recv() {
-            ingest_buf.push_back(more);
+
+        // Bounded ingest drain — this cap is load-bearing.
+        //
+        // An unbounded `while try_recv()` here looks harmless but livelocks the
+        // loop under sustained load: a client that publishes faster than we
+        // drain keeps the channel non-empty forever, so the loop never reaches
+        // the consensus work below. Measured, that collapsed the round rate from
+        // ~4000/s to ~44/s and drove publish→commit latency past eight seconds,
+        // while a huge unbounded `ingest_buf` absorbed the backlog and hid it.
+        //
+        // Draining at most a proposal's worth per wake means we take exactly
+        // what we can actually put in the next vertex, and leave the rest in the
+        // channel where it belongs — the channel is bounded, so the pressure
+        // propagates back to the publisher instead of turning into unbounded
+        // memory and multi-second latency here.
+        let drain_budget = cfg.max_items_per_vertex.saturating_sub(ingest_buf.len());
+        for _ in 0..drain_budget {
+            match cfg.ingest_rx.try_recv() {
+                Ok(more) => ingest_buf.push_back(more),
+                Err(_) => break,
+            }
         }
 
         // Apply all drained network messages, then commit once.

@@ -63,6 +63,27 @@ is the way it is are worth more than comments restating what the code does.
 Keeping the pure crates dependency-free is what will let them move into the
 future tile runtime, and what keeps consensus testable without a network.
 
+⚠️ **`peregrine-interop` compiles into a RISC-V zkVM guest.** Anything it
+depends on must build for `riscv*-succinct-zkvm-elf` — no tokio, no mio, no
+networking, no `std::net`. That is why `peregrine-data`'s subscriber fan-out
+sits behind a default-on `streams` feature and interop takes
+`default-features = false`.
+
+Two things that will bite you there:
+
+* Cargo **silently ignores** `default-features = false` on an *inherited*
+  workspace dependency unless the workspace entry sets it too. Declare the dep
+  by path in the member instead — `peregrine-interop/Cargo.toml` does, with a
+  comment saying why.
+* A `pub use` of a gated module must carry the same `#[cfg]`, or the crate
+  fails to compile with the feature off.
+
+Check your change with:
+
+```bash
+cargo check -p peregrine-interop --no-default-features   # guest-shaped build
+```
+
 **Determinism is a hard requirement.** Anything on the commit path must
 produce byte-identical state on every validator. No wall-clock reads, no
 iteration over `HashMap` where order escapes, no floating point in anything

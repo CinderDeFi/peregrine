@@ -36,7 +36,7 @@
 use peregrine_consensus::Vertex;
 #[cfg(test)]
 use peregrine_data::tables::TableId;
-use peregrine_data::tables::{TableRows, TableStore};
+use peregrine_data::tables::{TableRows, TableStore, TreeVersion};
 use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -60,6 +60,14 @@ pub struct DagSnapshot {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub tables: TableRows,
+    /// Which sparse-Merkle rule these rows were committed under.
+    ///
+    /// Persisted because the trees are rebuilt on load: without it a migrated
+    /// node would come back up computing v1 roots over v2 state and fork.
+    /// `#[serde(default)]` reads pre-upgrade snapshots as v1, which is what
+    /// they are.
+    #[serde(default)]
+    pub tree_version: TreeVersion,
 }
 
 impl StateSnapshot {
@@ -67,12 +75,13 @@ impl StateSnapshot {
     pub fn from_store(store: &TableStore) -> Self {
         Self {
             tables: store.snapshot_rows(),
+            tree_version: store.version(),
         }
     }
 
     /// Rebuild a table store from this snapshot (trees + roots recomputed).
     pub fn into_store(self) -> TableStore {
-        TableStore::restore_from_rows(self.tables)
+        TableStore::restore_from_rows_with_version(self.tables, self.tree_version)
     }
 }
 

@@ -18,11 +18,14 @@
 pub mod fees;
 pub mod merkle;
 pub mod smt;
+pub mod smt_v2;
+#[cfg(feature = "streams")]
 pub mod streams;
 pub mod tables;
 
 pub use fees::{DualMeter, FeeQuote, FeeSchedule, FeeSplit};
 pub use merkle::{MerkleProof, MerkleTree};
 pub use smt::{SmtProof, SparseMerkleTree};
+#[cfg(feature = "streams")]
 pub use streams::{StreamId, StreamRecord, StreamRegistry, StreamShred, SubscriberHandle};
 pub use tables::{ProvenAbsence, ProvenRead, RangeProof, TableId, TableStore};

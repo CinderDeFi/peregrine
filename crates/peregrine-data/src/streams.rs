@@ -193,19 +193,68 @@ impl StreamRegistry {
     ///
     /// Returns the record's byte size for data-meter accounting.
     pub fn apply_committed(&mut self, shred: &StreamShred) -> Result<u64, StreamError> {
+        // Verify inline. The signature is a pure predicate over the shred, so
+        // this is exactly `apply_committed_with` given a locally-computed
+        // verdict — see there for why the split exists.
+        let ok = match self.streams.get(&shred.record.stream) {
+            Some(st) => crypto::verify(
+                &st.publisher_key,
+                STREAM_DOMAIN,
+                &shred.record.signing_bytes(),
+                &shred.signature,
+            )
+            .is_ok(),
+            None => false,
+        };
+        self.apply_committed_with(shred, ok)
+    }
+
+    /// The public key a shred's signature must verify against, if its stream is
+    /// known. Lets a caller batch the (expensive, pure) signature checks across
+    /// tiles before entering the serial apply loop.
+    pub fn publisher_key_for(&self, shred: &StreamShred) -> Option<PublicKey> {
+        self.streams
+            .get(&shred.record.stream)
+            .map(|s| s.publisher_key)
+    }
+
+    /// The exact bytes a shred's signature covers.
+    pub fn signing_bytes_of(shred: &StreamShred) -> Vec<u8> {
+        shred.record.signing_bytes()
+    }
+
+    /// Apply a committed shred, trusting a **precomputed** signature verdict.
+    ///
+    /// # Why this exists
+    ///
+    /// Signature verification is ~25 µs and is a pure function of the shred;
+    /// everything else here mutates registry state and must stay serial and
+    /// ordered. Splitting them lets the verification run across tiles while
+    /// this stage keeps its single owner.
+    ///
+    /// # Determinism
+    ///
+    /// `sig_verified` must be the result of checking this shred's signature
+    /// against the key `publisher_key_for` returns — nothing else. Given that,
+    /// the outcome is identical to `apply_committed`, because the predicate is
+    /// the same one, merely computed earlier and elsewhere. **Passing an
+    /// unchecked `true` would let unsigned data into committed state**, so this
+    /// takes a verdict rather than a "skip verification" flag: there is no way
+    /// to call it that reads as "don't bother".
+    pub fn apply_committed_with(
+        &mut self,
+        shred: &StreamShred,
+        sig_verified: bool,
+    ) -> Result<u64, StreamError> {
         let id = shred.record.stream;
         let st = self
             .streams
             .get_mut(&id)
             .ok_or(StreamError::UnknownStream(id))?;
 
-        crypto::verify(
-            &st.publisher_key,
-            STREAM_DOMAIN,
-            &shred.record.signing_bytes(),
-            &shred.signature,
-        )
-        .map_err(|_| StreamError::BadSignature(id, shred.record.seq))?;
+        if !sig_verified {
+            return Err(StreamError::BadSignature(id, shred.record.seq));
+        }
 
         if shred.record.seq < st.next_seq {
             return Err(StreamError::StaleSeq {

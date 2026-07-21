@@ -10,6 +10,12 @@ license.workspace = true
 name = "peregrine"
 path = "src/main.rs"
 
+[features]
+default = []
+# Build a `peregrine` binary that can verify real ZK claims / BLS anchors.
+sp1 = ["peregrine-node/sp1"]
+bls = ["peregrine-node/bls"]
+
 [dependencies]
 peregrine-core.workspace = true
 peregrine-data.workspace = true
@@ -18,6 +24,7 @@ peregrine-sdk.workspace = true
 clap.workspace = true
 toml.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

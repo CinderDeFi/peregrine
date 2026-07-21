@@ -1,0 +1,55 @@
+# Publish the static site in `website/` to GitHub Pages.
+#
+# The site is a single self-contained HTML file — no build step, no npm
+# install, no supply chain. This workflow therefore just uploads a directory,
+# which is also why it is safe to run on every push to main.
+name: website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/pages.yml"
+  # Lets you publish a docs fix without pushing a commit to main.
+  workflow_dispatch:
+
+# Least privilege: read the repo, write only Pages, and mint an OIDC token for
+# the deploy. Nothing here needs `contents: write`.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. `cancel-in-progress: false` so a queued deploy of a
+# newer commit does not abort a running one mid-upload and leave Pages serving
+# a half-published state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cheap guard: catch an unclosed tag or a stray merge marker before it is
+      # served publicly. Not a full validator — just the mistakes that actually
+      # happen when hand-editing a page.
+      - name: Sanity-check the page
+        run: |
+          test -f website/index.html
+          grep -q "</html>" website/index.html
+          ! grep -qE '^(<<<<<<<|>>>>>>>)' website/index.html
+          echo "website/index.html looks well-formed"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website
+      - id: deployment
+        uses: actions/deploy-pages@v4

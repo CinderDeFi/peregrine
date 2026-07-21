@@ -38,16 +38,21 @@ pub mod beacon;
 pub mod eth;
 pub mod peregrine;
 pub mod sp1_backend;
+pub mod state;
 pub mod witness;
 pub mod zk;
 
 pub use eth::{verify_account_proof, verify_storage_proof, Account, BlockHeader, EthError};
-pub use peregrine::{verify_checkpoint, Checkpoint, SignedCheckpoint};
+pub use peregrine::{verify_checkpoint, Checkpoint, CommitteeDigest, SignedCheckpoint};
+pub use state::{
+    decode_state_journal, encode_state_journal, StateError, StateJournal, StateWitness,
+    STATE_JOURNAL_BYTES,
+};
 pub use witness::Witness;
 pub use zk::{Claim, Journal, Proof, Prover, VerifiedClaim, Verifier, ZkError};
 
 #[cfg(feature = "sp1")]
-pub use sp1_backend::{Sp1Mode, Sp1Prover, Sp1Verifier};
+pub use sp1_backend::{Sp1Mode, Sp1Prover, Sp1Verifier, StateProof};
 
 use eth::header::verify_header_chain;
 

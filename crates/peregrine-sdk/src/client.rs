@@ -5,6 +5,7 @@ use crate::tls;
 use peregrine_core::Hash;
 use peregrine_data::streams::StreamShred;
 use peregrine_data::tables::{ProvenRead, TableId};
+use peregrine_interop::VerifiedClaim;
 use peregrine_vm::Instr;
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -95,6 +96,17 @@ impl Client {
         self.expect_accepted(RpcRequest::SubmitTx(program)).await
     }
 
+    /// Submit a proof-carrying claim about another chain's state.
+    ///
+    /// `Accepted` means the claim entered the ingest queue — **not** that it
+    /// verified. Verification happens during commit on every validator, and a
+    /// claim that fails is dropped there. Poll the value with
+    /// [`prove_read`](Self::prove_read) to learn whether it was applied.
+    pub async fn submit_claim(&self, claim: VerifiedClaim) -> Result<(), SdkError> {
+        self.expect_accepted(RpcRequest::SubmitClaim(Box::new(claim)))
+            .await
+    }
+
     /// Read `key` from `table` with an inclusion proof against the store root,
     /// or `None` if absent. Verify the returned proof with
     /// [`ProvenRead::verify`] against [`store_root`](Self::store_root).
@@ -110,7 +122,7 @@ impl Client {
             })
             .await?
         {
-            RpcResponse::Proof(p) => Ok(p),
+            RpcResponse::Proof(p) => Ok(p.map(|b| *b)),
             RpcResponse::Error(e) => Err(SdkError::Node(e)),
             _ => Err(SdkError::Unexpected),
         }

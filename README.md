@@ -10,6 +10,13 @@
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Security policy](https://img.shields.io/badge/security-policy-red.svg)](SECURITY.md)
 [![Audit: none](https://img.shields.io/badge/audit-none-critical.svg)](SECURITY.md#audit-status)
+[![Website](https://img.shields.io/badge/website-peregrine--labs.github.io-blue.svg)](https://peregrine-labs.github.io/peregrine/)
+
+**[peregrine-labs.github.io/peregrine](https://peregrine-labs.github.io/peregrine/)** — overview, benchmarks, and demo instructions.
+
+📋 **Reviewing this code?** Start with **[AUDIT.md](AUDIT.md)** — scope, trust
+boundaries, sixteen named invariants, a threat model, and a ranked list of what
+to attack first. One page on the idea: **[docs/PITCH.md](docs/PITCH.md)**.
 
 A data-native, real-time Layer-1. This repository is the **solo bootstrap
 phase**: the minimal, honest skeleton of every core subsystem, wired
@@ -67,6 +74,47 @@ Act 4 is the one to watch: the default path **refuses**, because nothing has
 been proven. The demo then shows the success path explicitly labelled insecure,
 so the difference is impossible to miss.
 
+### A worked example: tokenized real-world assets
+
+```bash
+peregrine -q sdk example rwa
+```
+
+A property-backed loan whose health depends on three things Peregrine can
+prove and a bridge cannot: a **valuation** from a signed oracle stream, the
+**collateral** posted as USDC on *Ethereum* (read through a verified state
+proof), and a **TalonVM contract** that computes loan health from both.
+
+```text
+1. oracle valuation committed   : $500000.000000
+2. registered on-chain          : rwa.registry[PROP-1729-BRIXTON]
+
+3. verdict with UNVERIFIED collateral … ✓ as expected
+   (the tx trapped — an unproven balance is not a balance)
+
+   required collateral (30%)    : $150000.000000
+   collateral $200000.000000  (well collateralised) → HEALTHY
+   collateral $100000.000000  (short              ) → UNDER-COLLATERALISED
+
+4. verdict proof verifies       … ✓ as expected
+```
+
+The contract is nine instructions:
+
+```rust
+Instr::LoadTable    { table: registry, key: property },  // valuation (oracle)
+Instr::Push(30), Instr::Mul, Instr::Push(100), Instr::Div,  // required = 30%
+Instr::LoadEthState { chain_id: 1, address: USDC, slot },  // collateral (proven)
+Instr::Lt,                                                 // healthy?
+Instr::StoreTable   { table: health, key: property },
+Instr::Halt,
+```
+
+Step 3 is the point: `LoadEthState` **traps** when the Ethereum leg hasn't been
+verified, so an under-collateralised loan cannot be marked healthy by
+withholding data — missing data is an error, never a zero. A lender audits the
+verdict with the 32-byte store root alone.
+
 ### Other entry points
 
 ```bash
@@ -75,6 +123,31 @@ peregrine sim          # 5,000 ticks + a Talon tx; asserts identical store roots
 peregrine bench        # sustained throughput + latency percentiles
 peregrine --help       # every command
 ```
+
+### Watch it live
+
+In a second terminal, point `watch` at a running node:
+
+```bash
+peregrine watch --key contract.answers:meaning --key sys.eth_state:0x01…
+```
+
+```text
+PEREGRINE · live   127.0.0.1:9000   poll #37
+────────────────────────────────────────────────────────────
+store root   c36395fb…f301f665
+             changed since last poll
+────────────────────────────────────────────────────────────
+contract.answers:meaning  42                   ✓ proven
+sys.eth_state:0x01…       18                   ✓ proven
+
+every value above was verified against the root, locally
+```
+
+The dashboard is a **client**: it uses nothing but the public SDK, and every
+value it shows is re-verified against the root in your own process before it is
+printed. If a node lies, the line turns red — the dashboard cannot be used to
+launder an unproven value into a pretty display.
 
 ### Write and read some state
 
@@ -108,19 +181,19 @@ targets if you prefer.)
 ### Develop
 
 ```bash
-cargo test                                        # 127 tests, all crates
+cargo test                                        # 184 tests, all crates
 cargo test -p peregrine-interop --features bls    # + real BLS / mainnet fixtures
-cd contracts && forge test                        # EVM verifier (Foundry)
-cd sdk/js && npm install && npm test              # TypeScript light client
+cd contracts && forge test                        # EVM verifier (41 Foundry tests)
+cd sdk/js && npm install && npm test              # TypeScript light client (41 tests, v1+v2)
 make ci                                           # everything CI runs
 ```
 
 | Suite | Count | What it covers |
 | --- | --- | --- |
-| Rust (default) | 127 | consensus, data plane, VM, persistence, QUIC, SDK, CLI |
+| Rust (default) | 184 | consensus, data plane, VM, persistence, QUIC, SDK, CLI, tile pipeline, Merkle migration |
 | Rust (`--features bls`) | 84 | real mainnet BLS signatures + committee rotation |
-| Solidity (Foundry) | 9 | the EVM verifier's acceptance rules |
-| TypeScript | 18 | light-client proofs, verified against Rust-generated fixtures |
+| Solidity (Foundry) | 41 (+7 skipped) | the EVM verifier: rules, fuzzing, version pinning, cross-language encoding; the real-Groth16 suite skips pending a proof fixture |
+| TypeScript | 41 | light-client proofs for **both** Merkle versions, against Rust-generated fixtures |
 
 New here? [CONTRIBUTING.md](CONTRIBUTING.md) covers setup and the crate-boundary
 rules; [SECURITY.md](SECURITY.md) is blunt about what is and isn't safe;
@@ -168,11 +241,13 @@ peregrine/
 │   └── peregrine-cli/            # the `peregrine` binary
 │       ├── src/main.rs           #   clap command tree
 │       └── src/config.rs         #   TOML config: defaults, layering, validation
-└── sdk/js/                       # TypeScript SDK
-    ├── src/hash.ts               #   BLAKE3 + domain tags (mirrors Rust)
-    ├── src/verify.ts             #   light-client proof verification
-    ├── src/client.ts             #   typed client, pluggable transport
-    └── test/                     #   verifies real Rust-generated proofs
+├── sdk/js/                       # TypeScript SDK
+│   ├── src/hash.ts               #   BLAKE3 + domain tags (mirrors Rust, v1+v2)
+│   ├── src/verify.ts             #   light-client proof verification, version-dispatched
+│   ├── src/client.ts             #   typed client, pluggable transport
+│   └── test/                     #   verifies real Rust-generated proofs
+├── contracts/                    # EVM light client (Foundry) + AUDIT.md
+└── website/                      # the public site: one self-contained HTML file
 ```
 
 ## Architecture in one paragraph
@@ -267,17 +342,179 @@ Measured with `peregrine bench` on a **13th-gen Intel i9-13900HX (24C/32T),
 * **Sub-5 ms p50 publish→commit** at sustainable load, well inside the
   design's ~300 ms target (loopback has no WAN RTT, so treat this as a floor,
   not a WAN finality claim).
-* **Sustained ceiling ≈ 5.5k committed records/s** for this bootstrap. The
-  ceiling is **consensus/commit-side, not the transport**: the per-record cost
-  is dominated by ed25519 verification and a 256-deep sparse-Merkle update
-  replayed on every validator, not by QUIC. Past the knee, latency degrades
-  from ingest queueing (note the flood row: 580k published, 44k committed),
-  not from loss.
+* **Sustained ceiling ≈ 5.5k committed records/s under the original v1 tree.**
+  The ceiling was **consensus/commit-side, not the transport**: per-record cost
+  was dominated by ed25519 verification and a 256-deep sparse-Merkle update
+  replayed on every validator, not by QUIC. Both have since been addressed —
+  see the tiled pipeline and path compression below, which together move the
+  ceiling to **~34k records/s**. The table above is the v1 baseline, kept
+  because the before/after is the interesting part.
 * This is a bootstrap number on one laptop with unbatched crypto and
   full-mesh fanout. The design's 250k+ TPS target assumes 64-core validators,
-  hardware-batched signature verification, the share-nothing tile pipeline,
-  and Turbine-style stake-weighted fanout — none of which this scaffold
-  implements yet.
+  hardware-batched signature verification, and Turbine-style stake-weighted
+  fanout — none of which this scaffold implements yet.
+
+### The tiled pipeline
+
+Commit-side work is split into a **share-nothing tile pipeline**
+([`tiles.rs`](crates/peregrine-node/src/tiles.rs)): pinned OS threads that own
+their state, talk only over lock-free queues, and never touch the async
+runtime. Signature verification runs there; the state transition stays serial.
+
+**The design was chosen from a profile, not from architecture fashion.** Run it
+yourself — `cargo run --release -p peregrine-node --example vertex_profile`:
+
+| per committed record | cost | parallelisable |
+| --- | --- | --- |
+| ed25519 verify | 28 µs (25%) | ✅ tiles take this |
+| sparse-Merkle insert | 77 µs (69%) | ❌ it *is* the state transition |
+| other | 6 µs (6%) | — |
+
+Only a quarter of the work is parallel, so Amdahl caps tiling alone at ~1.33×
+— and that is almost exactly what it delivers (4,727 → 6,324 rec/s measured
+with `PEREGRINE_TILES=0` vs `=8` on the same binary). Anyone claiming a large
+speedup from "adding tiles" to a pipeline shaped like this is measuring
+something else.
+
+Measured, same machine, 4 validators, in-process:
+
+| offered load | tiles off | tiles on (8) |
+| --- | --- | --- |
+| 6,000 rec/s | p50 **134 ms** | p50 **16.8 ms** |
+| 8,000 rec/s | 5,577 rec/s, p50 1,074 ms | 6,170 rec/s, p50 537 ms |
+| 10,000 rec/s | 5,127 rec/s *(degrading)* | 6,443 rec/s, p50 1,074 ms |
+
+The headline is not peak throughput (+16%) but **where the knee moves**:
+sustainable load at p50 < 50 ms goes from ~4,000 to ~6,000 rec/s, and latency
+at 6,000 rec/s drops **8×**. Tiles buy headroom before saturation, which is
+what a real-time chain actually needs.
+
+`PEREGRINE_TILES=<n>` overrides the pool size (`0` disables it) so the same
+binary can be A/B'd — comparing two builds would confound the tile effect with
+everything else that differs between them.
+
+**Determinism is the load-bearing property.** Tiles change *when* verification
+happens, never what it decides: verdicts return indexed by input position and
+are applied in committed order, so validators with different core counts commit
+byte-identical state. Two validators disagreeing along hardware lines would
+fork the chain, so this is tested directly — `tiled_determinism.rs` drives
+identical batches through 0/1/4/8-tile pipelines and requires equal store
+roots, including for the rejection paths.
+
+### Two fixes that mattered more than the tiles
+
+Both were found by profiling rather than by reading the code, and both are the
+kind of thing an architecture diagram hides:
+
+1. **Congestion collapse (a real bug).** The validator drained its ingest
+   channel with an unbounded `while try_recv()`. Under sustained load that loop
+   never terminated, so the node never reached the consensus work below it:
+   round rate collapsed from ~4,000/s to ~44/s and publish→commit latency ran
+   past **eight seconds**, while an unbounded buffer absorbed the backlog and
+   hid the cause. The drain is now capped at one proposal's worth per wake, so
+   pressure propagates back to the publisher through the bounded channel
+   instead of turning into latency.
+
+2. **The sparse-Merkle tree, the actual bottleneck.** A 256-deep update paid
+   SipHash over a 34-byte key twice per level, for keys that are *already*
+   uniformly-distributed hashes, and rebuilt a streaming hasher per level.
+   Using a trivial hasher for node ids and a one-shot hash for interior nodes
+   took the per-row cost from **77 µs → 62 µs** with **byte-identical roots** —
+   verified by the existing SMT, light-client, and cross-language fixture tests.
+
+### Path compression (Merkle v2) — the ceiling, removed
+
+That 62 µs Merkle update was 67% of commit cost. It is now **2.0 µs — a 31×
+reduction** — via a path-compressed tree
+([`smt_v2.rs`](crates/peregrine-data/src/smt_v2.rs)).
+
+**Why this could not preserve roots.** A v1 root is *defined* as a 256-level
+fold, so a subtree holding one leaf still has a value produced by ~245 combines
+against empty defaults. Any implementation yielding the same root must do that
+work — "compression that preserves roots" saves memory and proof size but **not
+insert cost**, which was the entire bottleneck. Getting O(log n) means changing
+what a node hash *means*, and that changes every root. So this is a consensus
+upgrade, versioned and round-gated, not a refactor.
+
+v2 has three node kinds and no per-height defaults: a subtree containing one
+leaf simply *is* that leaf. Insert descends only to the first bit where two keys
+differ — expected O(log n), and proof depth drops from a fixed 256 to ~log₂(n).
+
+End-to-end, same binary, 4 validators (`PEREGRINE_MERKLE_V2=0` vs `1`):
+
+| offered load | v1 | v2 |
+| --- | --- | --- |
+| 10,000 rec/s | 5,853 rec/s, p50 **1,074 ms** | 9,593 rec/s, p50 **2.10 ms** |
+| 20,000 rec/s | — (saturated) | 19,993 rec/s, p50 **4.19 ms**, p99 16.8 ms |
+| flood | 6,911 rec/s | **34,154 rec/s** |
+
+**Sustained ceiling: ~5.5k → ~34k records/s (6.2×).** At 10k/s the node went
+from saturated-and-collapsing to keeping up with room to spare, and round rate
+rose from 194 to 26,277 over the same window. Latency at load improved by
+roughly **500×** because the system is no longer past its knee.
+
+### Migrating a live chain
+
+The upgrade is gated on a **committed round**, not wall-clock time, node start,
+or an operator command:
+
+```rust
+ExecutionPipeline::new().with_merkle_v2_at(activation_round)
+```
+
+Every validator observes the same committed sequence, so every one migrates at
+the same point in it and they agree on every root thereafter. Migration happens
+*before* that round's payloads are applied, so the boundary is unambiguous:
+everything committed at or after the activation round is authenticated under v2.
+
+⚠️ **`merkle_v2_activation` is a consensus parameter.** Validators carrying
+different activation rounds compute different roots for identical state and
+**fork**. It belongs in genesis, and changes only by coordinated upgrade —
+exactly like `ClaimPolicy`.
+
+What the migration does and does not touch:
+
+* **Rows are the authority and are untouched.** `get` returns identical bytes
+  before and after; only the commitment changes. A migration that could alter a
+  *value* would be a state transition wearing an upgrade's clothes.
+* **Roots change, by design.** Light clients must re-pin. A v1 proof is refused
+  against a v2 root and vice versa — tested in both directions.
+* **Proofs are self-describing** (`RowProof::V1 | V2`). During a rollout both
+  are in flight, and a proof that did not declare its rule would be verified
+  under the wrong one. The JS fixture now carries `treeVersion` so the
+  TypeScript verifier — which implements **v1 only** — can *refuse* a v2 proof
+  rather than silently disagree with the chain.
+* **Restart safety.** The trees are rebuilt from rows on load, so the snapshot
+  records its version. Without that, a migrated node would come back computing
+  v1 roots over v2 state and fork from the network it had just agreed with.
+* **Idempotent.** A replayed activation is a no-op, so a node restarted mid
+  upgrade cannot churn the root.
+
+`crates/peregrine-node/tests/merkle_migration.rs` covers each of these,
+including that a migrated store and a natively-v2 store are indistinguishable
+(otherwise a rebuilt node would fork from a migrated one).
+
+**Both verifiers now support v2.** The TypeScript light client verifies v1 and
+v2, dispatching on the version tag and *refusing* an unknown one rather than
+guessing — a silent fallback would verify a future v3 proof under the wrong
+rule, the exact failure the tag exists to prevent. Fixtures are generated for
+both versions, including v2's two structurally different non-inclusion shapes
+(empty slot vs. a different key occupying it), because a verifier tested only
+on inclusion would miss the path where a lax implementation lets any leaf deny
+any key.
+
+The EVM client gained a fourth pin, `treeVersion`. It verifies a zkVM proof
+rather than Merkle paths, so path compression does not change its mechanics —
+but it previously could not tell *which rule* a journal's `storeRoot` was
+computed under, and a v1 root and a v2 root over identical state are different
+32-byte values. The guest now commits the version, **derived from the proof it
+actually verified** rather than taken as an input (a relayer that could declare
+the version would simply claim whatever the consumer pins). A client pinned to
+one version refuses the other in both directions.
+
+`TableStore::new()` still defaults to v1 so nothing changes roots merely by
+being recompiled; a chain that has migrated serves v2 and needs clients
+deployed with `TREE_VERSION=2`.
 
 **Networking limitations (bootstrap):** dev TLS (self-signed cert per node,
 skip-verify client) — production binds the validator's ed25519 identity into
@@ -420,8 +657,8 @@ if let Some(read) = client.prove_read(TableId::named("contract.answers"), b"sum"
 }
 ```
 
-`Client` covers `ping`, `publish`, `submit_tx`, `prove_read`, and
-`store_root`, and re-exports the types you need so an app depends only on
+`Client` covers `ping`, `publish`, `submit_tx`, `submit_claim`, `prove_read`,
+and `store_root`, and re-exports the types you need so an app depends only on
 `peregrine-sdk`.
 
 ### How a client request is served
@@ -438,6 +675,61 @@ become a message answered *inside* the validator loop, keeping the pipeline
 single-owner — committed state is never shared behind a lock. Each request
 gets its own stream and task. The wire protocol lives in the SDK and the node
 depends on it, so there is one source of truth for the contract.
+
+### Submitting a foreign claim over RPC
+
+A relayer hands Peregrine a proof-carrying claim about Ethereum state the same
+way it submits anything else:
+
+```bash
+peregrine submit-claim ./claim.json          # a serialized VerifiedClaim
+#   claim  : chain 1 block 25580559
+#   proof  : ZK
+#   queued for verification at 127.0.0.1:9000
+peregrine read sys.eth_state 0x01…           # did consensus actually accept it?
+```
+
+```rust
+client.submit_claim(claim).await?;            // queued, not believed
+```
+
+**A successful submission means "queued", never "accepted".** The RPC front
+door checks only size and rate; the cryptography is checked later, by *every*
+validator, inside the commit path — image ID, chain ID, journal binding, and a
+BLS-verified anchor, in that order. That split is the point: an RPC endpoint
+must never be the thing deciding what consensus believes, because then anyone
+who can reach the endpoint decides. The only way to confirm a claim landed is
+to read the state back and verify the proof yourself.
+
+### Admission control
+
+`rpc_limits.rs` weights requests by the work they impose downstream rather than
+counting them, because a `Ping` and an 8 MB proof are not the same load:
+
+| request | cost | why |
+|---|---|---|
+| `ping` | 1 | liveness only |
+| `prove_read` / `store_root` | 4 | served from committed state |
+| `publish` / `submit_tx` | 16 | enters the ingest queue |
+| `submit_claim` | 256 | large on the wire, *and* expensive to verify on every validator |
+
+Each connection gets a token bucket (default: 1024 burst, 128 tokens/sec —
+roughly four claims of burst, refilling one every two seconds). A bucket
+absorbs a legitimate batch while still bounding the sustained rate, which a
+fixed window cannot do without either rejecting the batch or permitting double
+the intended rate across a boundary. Claims are additionally capped at
+`MAX_CLAIM_BYTES` (8 MB) and rejected **before** deserialization, so an
+oversized frame costs a length check rather than an allocation.
+
+Bearer auth is available (`RpcLimits::auth_token`) and compared in constant
+time, but is **off by default** — a token baked into a public scaffold would be
+worse than none, because it would look like protection.
+
+⚠️ **This is not Sybil resistance.** Buckets are per connection, so an attacker
+with many connections gets many buckets. It bounds what one client can push and
+makes an accidental flood (a looping script) harmless; real protection needs
+stake- or key-weighted admission across connections, which this scaffold does
+not have. See [SECURITY.md](SECURITY.md).
 
 ### TypeScript — verify, don't trust
 
@@ -516,13 +808,58 @@ Gas is then constant regardless of proof depth.
 Its `getVerifiedValue` **reverts** for an unproven key rather than returning
 zero — the same trap `LoadEthState` avoids in the other direction.
 
-It is a **Foundry project that builds and tests**: `forge build` + `forge test`
-(9 tests, solc 0.8.24, no `forge-std` so there are no submodules), plus a
-deployment script. Measured gas: ~29k–123k for `verifyPeregrineState` (the real
-Groth16 verification adds ~250k on top), ~5k for `getVerifiedValue`.
+#### The three pins
 
-⚠️ **Unaudited, undeployed, and never run against a real Groth16 proof** — the
-tests use a mock verifier. See [`contracts/README.md`](contracts/README.md).
+A proof only means something relative to what it is a proof *of*. Three
+immutable values fix that, and all three are checked on every call:
+
+| Pin | Answers | If wrong |
+|---|---|---|
+| `programVKey` | which program ran | a proof of a *different* program is accepted — still a valid proof, of something else |
+| `committeeDigest` | whose signatures counted | a proof built against an attacker's validator set is accepted |
+| `peregrineChainId` | which network | a testnet proof applies to mainnet |
+
+None has a setter. An upgradeable pin is an admin key that can redefine what
+every past and future proof meant, which would make the cryptography
+decorative. The cost is that changing one means a new deployment.
+
+#### Testing
+
+```bash
+cd contracts
+git submodule update --init --recursive    # forge-std
+forge build && forge test -vv              # 41 tests incl. 512-run fuzzing
+```
+
+Six invariants are stated in the contract's NatSpec and each has a test — most
+importantly that **verification strictly precedes decoding** (the proof is
+checked before a single field of the public values is read), that
+**equivocation reverts** rather than being absorbed, and that a **contradiction
+reverts** rather than silently overwriting. `contracts/AUDIT.md` maps each
+invariant to its test.
+
+Two things are cross-checked that neither language can verify alone:
+
+- **The journal encoding.** The guest hand-writes eight 32-byte words; Solidity
+  `abi.decode`s them. A silent disagreement would shift every field — a `round`
+  read as a `chainId` — and nothing would fail loudly. A Rust-generated fixture
+  is decoded, re-encoded, and compared byte-for-byte in Solidity.
+- **A real Groth16 proof**, to be verified by SP1's own `SP1VerifierGroth16`
+  (vendored at the circuit version SP1 v6 produces), doing the full BN254
+  pairing on-chain with no mock in the path. ⚠️ This test is **written but not
+  yet run** — generating the proof needs Docker, which was unavailable here, so
+  it skips loudly rather than looking like a pass. Running it is the
+  highest-value next step for this contract.
+
+Static analysis: **Slither reports 0 findings** across 101 detectors on the
+shipped contract ([`contracts/SLITHER.md`](contracts/SLITHER.md)). That is not
+an audit — Slither finds patterns, and cannot tell you whether the right
+committee is pinned.
+
+⚠️ **Unaudited and undeployed.** Also: **committee rotation is not
+implemented**, so a Peregrine validator-set change requires deploying a new
+client. That is the weakest link in this direction. See
+[`contracts/AUDIT.md`](contracts/AUDIT.md).
 
 ### Reading Peregrine from elsewhere (reciprocal)
 
@@ -611,10 +948,29 @@ proof — and **every validator verifies it independently during commit**, so
 acceptance is part of the state transition rather than something a relayer is
 trusted to have done.
 
+Proof verification happens **inside the commit path**, so accepting a claim is
+part of the state transition. Two consequences the design has to respect:
+
+* **It must be bounded.** Verifying a proof costs orders of magnitude more than
+  anything else on the commit path, so a vertex stuffed with claims would be a
+  consensus-halting DoS. At most `MAX_CLAIMS_PER_COMMIT` (4) are verified per
+  commit batch, and each is charged `CU_VERIFY_CLAIM` on the compute meter
+  **whether or not it is accepted** — an attacker must not get free
+  proof-checking by submitting garbage. The cap is counted per batch and reset
+  at the same point in the committed order on every validator, so it cannot
+  itself cause a fork (`the_budget_is_deterministic_across_validators`).
+* **The verifying key is derived once, at startup.** Deriving it dominates the
+  cost of checking a proof against it, so `Sp1Verifier` does it in its
+  constructor — which also means a node whose local guest ELF doesn't match the
+  pinned image id **refuses to start** rather than discovering the mismatch
+  mid-consensus.
+
 A claim must clear **two** independent gates:
 
 1. its proof must satisfy the node's `ClaimPolicy` (**defaults to
-   `RejectAll`**), and
+   `RejectAll`**; `ClaimPolicy::sp1(image_id, chain_id)` is what a production
+   validator runs, and `ClaimPolicy::strict(..)` fails closed on builds without
+   `--features sp1`), and
 2. its `block_hash` must be in the node's `AnchorStore` — **anchoring is
    mandatory**. A perfect proof about a block nobody anchored is refused, which
    is what stops a relayer proving a self-consistent chain it invented. A node
@@ -664,23 +1020,61 @@ cd crates/peregrine-eth-guest && cargo prove build   # → guest ELF
 cargo test -p peregrine-interop --features sp1       # host proving/verification
 ```
 
-⚠️ **The `sp1` feature has not been compiled or run, and no proof has ever been
-generated in this repo.** It is written against **SP1 v6.3** and gated off by
-default. What was actually established, by attempting it:
+**Real proofs have been generated and verified.** A compressed STARK proof of
+Ethereum block verification, measured on a 13th-gen i9 (WSL2, CPU proving):
 
-* **SP1 v6 does not build on Windows at all** — not even verification-only.
-  `sp1-jit` (pulled in transitively by the mandatory `sp1-prover`) uses POSIX
-  shared memory (`shm_unlink`, `create_anonymous_file`), and `sp1-sdk` exposes
-  no feature flag to exclude it. Use Linux, macOS, or WSL2.
-* One blocker *was* fixable and is worth knowing: the build first fails with
-  `Could not find protoc`. Install the protobuf compiler (no admin needed —
-  the win64/linux zip from protobuf releases works) and set `PROTOC`.
+```text
+mainnet block   : #25580559
+program image id: 0x002409f0efd0de2be2bf9a091e1ae561b91ab682737d3f0cc3f7691ebaefece6
+proving (compressed STARK — no trusted setup)…
+proved in       : 171.3s
+proof is ZK     : true
+journal matches native verification: yes
+verified in     : 19.3s   (includes one-time key derivation — see below)
+wrong image id refused: true
 
-The pure verification core and **every security rule below is fully tested
-without SP1**, deliberately: generating a proof is environment-dependent, but
-the rules a validator enforces when accepting one are pure logic and should be
-tested everywhere. Treat the SP1 backend itself as unverified integration code
-until you have run the commands above on a supported platform.
+PROVEN: Ethereum blocks 25580559..=25580559 verified inside a zkVM.
+```
+
+Three things are confirmed at once: the guest computes the right journal, the
+host verifies it, and the two agree on the statement — the guest's committed
+public values are byte-identical to the native verification's journal.
+
+**And through the real commit path.** `tests/zk_commit_path.rs` proves an
+Ethereum *storage* read (WETH's `decimals` slot, over a real mainnet MPT
+witness) and pushes it through `ExecutionPipeline` exactly as consensus would:
+
+```text
+proving (MPT witness, compressed STARK)…
+proved in                      : 213.0s
+verified in commit path        : 52.4ms      ← what a validator actually pays
+value materialized in sys.eth_state: 18
+test result: ok. 3 passed
+```
+
+The asymmetry is the whole design: proving is minutes and happens **once**,
+off-chain, by whoever wants the claim believed; verification is milliseconds
+and happens on **every** validator, in consensus. 52 ms is affordable per
+commit — which is why `MAX_CLAIMS_PER_COMMIT` is a small constant rather than
+unbounded. (The verifying key is derived once at construction; deriving it per
+call cost 19.3 s and would have made this unusable.)
+
+The other two tests are the ones that matter for security: a valid proof
+stapled to a different journal is refused, and a proof of a different program
+is refused at verifier construction — so a misconfigured node fails at startup
+rather than mid-consensus.
+
+⚠️ **SP1 does not build on Windows** — `sp1-jit` (pulled in transitively by the
+mandatory `sp1-prover`) uses POSIX shared memory, and there is no feature flag
+to exclude it. Use Linux, macOS, or WSL2. Two blockers worth knowing about, both
+fixable without root: `protoc` is required by `sp1-prover-types`' build script
+(the conda-forge `protobuf` package does **not** ship the binary — take the
+upstream release zip and set `PROTOC`), and a C toolchain is needed to link at
+all (`micromamba install -c conda-forge c-compiler` works without `sudo`).
+
+Every security rule below is *also* tested **without** SP1, deliberately:
+generating a proof is environment-dependent, but the rules a validator enforces
+when accepting one are pure logic and should be tested everywhere.
 
 ### Security notes (audit-oriented)
 
@@ -743,8 +1137,8 @@ not they are accepted; unpriced verification is a denial-of-service vector.
 | Beacon SSZ roots + finality/execution branches | **real, tested vs mainnet** |
 | **BLS12-381 sync-committee signatures** | **real, verified against a live mainnet aggregate** |
 | Trust in a relayer / multisig | **none, by construction** |
-| SP1 guest + host backend | ⚠️ **written, not compile-verified here** |
-| Real proof generation | ❌ **never run in this environment** |
+| SP1 guest + host backend | **real — builds and proves** |
+| Real proof generation | **done: 171s prove, 19s verify, image pinning enforced** |
 | **Sync-committee rotation** (`next_sync_committee`) | **real, tested vs mainnet — anchoring is autonomous** |
 | EVM verifier contract (`contracts/`) | **compiles + 9 Foundry tests**; ⚠️ unaudited, undeployed, mock verifier |
 

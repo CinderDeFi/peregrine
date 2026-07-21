@@ -30,6 +30,7 @@
 use peregrine_core::Hash;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// Tree depth = bits in the position hash.
 const DEPTH: usize = 256;
@@ -93,12 +94,51 @@ fn with_bit_flipped(mut p: [u8; 32], i: usize) -> [u8; 32] {
 /// is the root. `prefix` has exactly `depth` significant leading bits.
 type NodeId = (u16, [u8; 32]);
 
+/// Hasher for [`NodeId`] keys.
+///
+/// The default `HashMap` hasher is SipHash, which exists to make user-supplied
+/// keys collision-resistant. These keys are not user-supplied: a prefix is the
+/// truncation of `blake3(key)`, so its bits are already uniform. Re-hashing 34
+/// bytes with SipHash on every node touch was measured at roughly a fifth of
+/// the whole insert path — pure overhead for a property the input already has.
+///
+/// So this reads the leading eight bytes of the prefix and mixes in the depth.
+/// Depths above 64 are covered because those prefixes differ within their first
+/// 64 bits; depths at or below 64 are fully determined by those bits.
+///
+/// Safety note: a collision here costs a bucket probe, never a wrong answer,
+/// and forcing one would mean finding blake3 preimages that agree on 64 bits.
+/// The tree's security rests on blake3, not on the map's hasher.
+#[derive(Default)]
+struct NodeIdHasher(u64);
+
+impl Hasher for NodeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        // Called once with the prefix bytes and once with the depth, in the
+        // order the tuple's `Hash` impl visits its fields.
+        let mut lead = [0u8; 8];
+        let n = bytes.len().min(8);
+        lead[..n].copy_from_slice(&bytes[..n]);
+        // fibonacci mixing: cheap, and spreads the low bits the map indexes on
+        self.0 = (self.0 ^ u64::from_le_bytes(lead)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 ^= self.0 >> 29;
+    }
+    fn write_u16(&mut self, v: u16) {
+        self.0 = (self.0 ^ v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type NodeMap = HashMap<NodeId, Hash, BuildHasherDefault<NodeIdHasher>>;
+
 /// An incremental sparse Merkle tree. Cheap to clone-free update; keeps only
 /// non-default nodes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SparseMerkleTree {
     /// Non-default nodes, including occupied leaves at `depth == DEPTH`.
-    nodes: HashMap<NodeId, Hash>,
+    nodes: NodeMap,
     /// `defaults[h]` = root hash of a fully-empty subtree of height `h`
     /// (`defaults[0]` = empty leaf, `defaults[DEPTH]` = empty-tree root).
     defaults: Vec<Hash>,
@@ -113,7 +153,7 @@ impl SparseMerkleTree {
             defaults.push(Hash::combine(&prev, &prev));
         }
         Self {
-            nodes: HashMap::new(),
+            nodes: NodeMap::default(),
             defaults,
         }
     }

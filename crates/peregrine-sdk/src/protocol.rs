@@ -7,11 +7,19 @@
 use peregrine_core::Hash;
 use peregrine_data::streams::StreamShred;
 use peregrine_data::tables::{ProvenRead, TableId};
+use peregrine_interop::VerifiedClaim;
 use peregrine_vm::Instr;
 use serde::{Deserialize, Serialize};
 
 /// Reject absurd frame lengths before allocating.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// Largest accepted claim submission.
+///
+/// A compressed STARK proof runs to a few MB; anything an order of magnitude
+/// past that is not a claim we can use, and refusing it *before* allocating
+/// keeps a single request from deciding how much memory the node commits.
+pub const MAX_CLAIM_BYTES: usize = 8 * 1024 * 1024;
 
 /// A request from a client to a node.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,6 +30,17 @@ pub enum RpcRequest {
     Publish(StreamShred),
     /// Submit a Talon program to execute on commit.
     SubmitTx(Vec<Instr>),
+    /// Submit a proof-carrying claim about another chain's state.
+    ///
+    /// Boxed because a claim carrying a real ZK proof is orders of magnitude
+    /// larger than every other request — keeping it off the stack stops the
+    /// whole enum from being sized by its worst case.
+    ///
+    /// Anyone may submit one: it needs no signature because it carries its own
+    /// proof, and every validator re-verifies it during commit. What the RPC
+    /// layer must do is stop a *flood* of them from crowding out consensus
+    /// traffic — see the rate limiting in `peregrine-node::rpc`.
+    SubmitClaim(Box<VerifiedClaim>),
     /// Ask for a value plus an inclusion proof against the current store root.
     ProveRead { table: TableId, key: Vec<u8> },
     /// Ask for the node's current 32-byte store root.
@@ -35,7 +54,11 @@ pub enum RpcResponse {
     /// The submission was accepted into the ingest queue (not yet committed).
     Accepted,
     /// A proven read result (`None` if the key is absent).
-    Proof(Option<ProvenRead>),
+    ///
+    /// Boxed: a `ProvenRead` carries a full Merkle path and dwarfs every other
+    /// variant, so an unboxed one would make `Pong` cost as much to move as a
+    /// proof. It grew again when row proofs became version-tagged.
+    Proof(Option<Box<ProvenRead>>),
     /// The current store root.
     Root(Hash),
     /// The node could not service the request.

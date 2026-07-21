@@ -24,9 +24,14 @@ import {
 import type { ProvenReadJson } from "../src/verify.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const fixture = JSON.parse(
-  readFileSync(join(here, "fixtures", "proven-read.json"), "utf8"),
-) as { storeRoot: string; reads: ProvenReadJson[] };
+// The fixture now carries both tree versions. The client is version-agnostic
+// — it moves proofs around and hands them to the verifier — so these tests
+// exercise it against v2, the format a current chain serves.
+const fixture = (
+  JSON.parse(readFileSync(join(here, "fixtures", "proven-read.json"), "utf8")) as {
+    v2: { storeRoot: string; reads: ProvenReadJson[] };
+  }
+).v2;
 
 /** A transport that replays canned responses and records what it was asked. */
 class StubTransport implements Transport {

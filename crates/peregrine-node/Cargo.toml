@@ -5,6 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Real SP1 proof verification in the commit path. Off by default: `sp1-sdk` is
+# a very large dependency and does not build on Windows, and a node without it
+# fails closed (`StrictVerifier` rejects every ZK claim).
+sp1 = ["peregrine-interop/sp1"]
+# Real BLS sync-committee verification, needed to mint anchors.
+bls = ["peregrine-interop/bls"]
+
 [dependencies]
 peregrine-core.workspace = true
 peregrine-consensus.workspace = true
@@ -25,6 +34,9 @@ hex.workspace = true
 # to peregrine-node so the pure-logic crates (core/consensus/data/vm) stay
 # dependency-free and portable to the future tile runtime.
 redb = "2"
+# Tile runtime: pinned OS threads + lock-free queues.
+crossbeam-channel.workspace = true
+core_affinity.workspace = true
 # Real QUIC transport (validator mesh + client-facing RPC). Dev TLS only
 # (self-signed + skip-verify); production binds validator identity into the cert.
 quinn.workspace = true

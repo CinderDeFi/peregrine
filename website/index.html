@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Peregrine — the data plane of the autonomous economy</title>
+<meta name="description" content="A data-native, real-time Layer-1. Signed high-frequency records ride inside consensus, materialize into Merkle-verifiable tables, and a light client with a 32-byte root verifies any read." />
+<meta property="og:title" content="Peregrine — data-native real-time Layer-1" />
+<meta property="og:description" content="Streams + verifiable state. Fly fast. Prove everything." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%A6%85</text></svg>" />
+<style>
+  /* Self-contained: no external fonts, scripts, or stylesheets. The site is a
+     single file so it can be dropped on GitHub Pages, Netlify, or any bucket
+     with no build step and no supply chain. */
+  :root {
+    --bg: #fbfaf8; --fg: #16150f; --muted: #5d5b52; --line: #e2ded4;
+    --card: #ffffff; --accent: #9a3412; --accent-soft: #fdf1ea;
+    --code-bg: #f4f1ea; --ok: #2f6b3c; --warn: #8a5a00;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12110f; --fg: #edeae2; --muted: #a3a096; --line: #2b2924;
+      --card: #191713; --accent: #f0855a; --accent-soft: #241a15;
+      --code-bg: #1d1b16; --ok: #7fbf8c; --warn: #d9a84a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--sans); line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+  header { border-bottom: 1px solid var(--line); }
+  nav { display: flex; align-items: center; gap: 20px; padding: 16px 0; flex-wrap: wrap; }
+  nav .brand { font-weight: 700; letter-spacing: .14em; font-size: .82rem; margin-right: auto; }
+  nav a { font-size: .88rem; color: var(--muted); text-decoration: none; }
+  nav a:hover { color: var(--fg); }
+
+  .hero { padding: 72px 0 56px; }
+  h1 { font-size: clamp(2.4rem, 7vw, 4rem); line-height: 1.05; margin: 0 0 .3em; letter-spacing: -.03em; }
+  .tag { font-family: var(--mono); color: var(--accent); font-size: .95rem; margin-bottom: 28px; }
+  .lede { font-size: 1.2rem; color: var(--muted); max-width: 62ch; margin: 0 0 32px; }
+  .cta { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+  .btn {
+    display: inline-block; padding: 11px 20px; border-radius: 8px;
+    text-decoration: none; font-weight: 600; font-size: .95rem; border: 1px solid var(--line);
+  }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.ghost { color: var(--fg); background: var(--card); }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    font-family: var(--mono); font-size: .72rem; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+
+  section { padding: 52px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 1.55rem; margin: 0 0 .5em; letter-spacing: -.02em; }
+  h3 { font-size: 1rem; margin: 0 0 .35em; }
+  p { max-width: 68ch; }
+  .muted { color: var(--muted); }
+
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-family: var(--mono);
+    font-size: .84rem; line-height: 1.6;
+  }
+  code { font-family: var(--mono); font-size: .88em; }
+  p code, li code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .card p { font-size: .92rem; color: var(--muted); margin: 0; }
+
+  .stats { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin: 8px 0 24px; }
+  .stat .n { font-family: var(--mono); font-size: 1.7rem; color: var(--accent); font-weight: 600; }
+  .stat .l { font-size: .82rem; color: var(--muted); }
+
+  .table-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; min-width: 460px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  td.num { font-family: var(--mono); }
+
+  .note {
+    background: var(--accent-soft); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 16px 18px; margin: 24px 0;
+  }
+  .note p { margin: 0; font-size: .93rem; }
+  .note strong { color: var(--fg); }
+
+  ul.clean { list-style: none; padding: 0; }
+  ul.clean li { padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .94rem; }
+  ul.clean li:last-child { border-bottom: 0; }
+  ul.clean a { font-weight: 600; }
+  ul.clean span { color: var(--muted); }
+
+  footer { border-top: 1px solid var(--line); padding: 32px 0 56px; color: var(--muted); font-size: .86rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <nav>
+      <span class="brand">PEREGRINE</span>
+      <a href="why.html">Why</a>
+      <a href="#what">What it is</a>
+      <a href="#try">Try it</a>
+      <a href="#performance">Performance</a>
+      <a href="#docs">Docs</a>
+      <a href="https://github.com/peregrine-labs/peregrine">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>The data plane of the<br />autonomous economy.</h1>
+    <div class="tag">fly fast. prove everything.</div>
+    <p class="lede">
+      A data-native, real-time Layer-1. Signed high-frequency records ride
+      <em>inside</em> consensus dissemination, commit to a deterministic total
+      order, and materialize into Merkle-verifiable tables — so a light client
+      holding 32 bytes can verify any read for itself.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#try">Run the demo</a>
+      <a class="btn ghost" href="why.html">Why Peregrine →</a>
+      <a class="btn ghost" href="https://github.com/peregrine-labs/peregrine">GitHub</a>
+    </div>
+    <div class="badges">
+      <span class="badge">Apache-2.0</span>
+      <span class="badge">Rust 1.85+</span>
+      <span class="badge">184 Rust tests</span>
+      <span class="badge">41 Solidity tests</span>
+      <span class="badge warn">unaudited · holds no value</span>
+    </div>
+  </div>
+
+  <div class="note">
+    <p>
+      <strong>This is a bootstrap scaffold, not production software.</strong>
+      It has never been audited or deployed, and holds no value. The
+      <a href="https://github.com/peregrine-labs/peregrine#honest-limitations-of-this-bootstrap">honest
+      limitations</a> section of the README is long on purpose, and
+      <a href="https://github.com/peregrine-labs/peregrine/blob/main/SECURITY.md">SECURITY.md</a>
+      lists what is deliberately unsafe.
+    </p>
+  </div>
+
+  <section id="what">
+    <h2>Verify, don't trust</h2>
+    <p class="muted">
+      Most chains ask you to trust an RPC provider for reads. Peregrine's
+      answer is that every read carries its own proof, and every cross-chain
+      fact is re-derived from cryptography the verifier checks itself — no
+      multisig, no privileged key, no trusted relayer anywhere.
+    </p>
+    <div class="grid" style="margin-top:24px">
+      <div class="card">
+        <h3>Slipstream</h3>
+        <p>Signed records ride inside consensus vertices rather than queueing behind blocks, then materialize into a queryable table.</p>
+      </div>
+      <div class="card">
+        <h3>Stoop BFT</h3>
+        <p>An uncertified DAG in the Mysticeti lineage. Finality is a function of round-trip time, not block time.</p>
+      </div>
+      <div class="card">
+        <h3>TalonVM</h3>
+        <p>A metered stack machine with a dual meter — compute units <em>and</em> data bytes — so data-heavy work is priced honestly.</p>
+      </div>
+      <div class="card">
+        <h3>Proven interop</h3>
+        <p>Ethereum state verified inside a zkVM at consensus time, and a reciprocal Solidity client so Ethereum can read Peregrine.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="try">
+    <h2>Try it in ten seconds</h2>
+    <p class="muted">A real 4-validator network over real QUIC, end to end.</p>
+    <pre><code>git clone https://github.com/peregrine-labs/peregrine &amp;&amp; cd peregrine
+cargo install --path crates/peregrine-cli
+
+peregrine demo          # the whole tour: streams, VM, light client, interop
+peregrine devnet up     # a local network with a client RPC endpoint
+peregrine watch         # live dashboard — every value re-verified locally</code></pre>
+    <p class="muted" style="margin-top:20px">
+      The demo's fourth act is the one to watch: a contract tries to read
+      Ethereum state that has not been proven, and the transaction
+      <strong>traps</strong>. Missing data is an error, never a zero.
+    </p>
+  </section>
+
+  <section id="performance">
+    <h2>Performance</h2>
+    <p class="muted">
+      Measured with <code>peregrine bench</code> on a 13th-gen i9 (24C/32T),
+      4 validators, release build. Reproduce any row yourself.
+    </p>
+    <div class="stats">
+      <div class="stat"><div class="n">~34k</div><div class="l">records/s sustained</div></div>
+      <div class="stat"><div class="n">4.19 ms</div><div class="l">p50 publish→commit at 20k/s</div></div>
+      <div class="stat"><div class="n">52 ms</div><div class="l">ZK proof verified in-consensus</div></div>
+      <div class="stat"><div class="n">31×</div><div class="l">Merkle speedup from path compression</div></div>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Offered load</th><th>Committed</th><th>p50 latency</th><th>Keeps up?</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">6,000/s</td><td class="num">6,000/s</td><td class="num">2.1 ms</td><td>yes</td></tr>
+          <tr><td class="num">10,000/s</td><td class="num">9,593/s</td><td class="num">2.1 ms</td><td>yes</td></tr>
+          <tr><td class="num">20,000/s</td><td class="num">19,993/s</td><td class="num">4.19 ms</td><td>yes</td></tr>
+          <tr><td class="num">40,000/s</td><td class="num">34,281/s</td><td class="num">1,074 ms</td><td>past the knee</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="muted" style="margin-top:20px; font-size:.9rem">
+      Loopback has no WAN round-trip, so treat the latency figures as a floor
+      rather than a finality claim. The ceiling is commit-side, not transport:
+      it moved from ~5.5k to ~34k records/s by tiling signature verification
+      onto pinned cores and replacing a dense 256-level Merkle tree with a
+      path-compressed one.
+    </p>
+  </section>
+
+  <section id="docs">
+    <h2>Documentation</h2>
+    <ul class="clean">
+      <li><a href="https://github.com/peregrine-labs/peregrine/blob/main/AUDIT.md">AUDIT.md</a> — <span>scope, invariants, threat model, and what to attack first</span></li>
+      <li><a href="https://github.com/peregrine-labs/peregrine#readme">README</a> — <span>architecture, benchmarks, and the full limitations list</span></li>
+      <li><a href="https://github.com/peregrine-labs/peregrine/blob/main/SECURITY.md">SECURITY.md</a> — <span>audit status and what is deliberately unsafe</span></li>
+      <li><a href="https://github.com/peregrine-labs/peregrine/tree/main/contracts">contracts/</a> — <span>the EVM light client, with <code>AUDIT.md</code> and Slither notes</span></li>
+      <li><a href="https://github.com/peregrine-labs/peregrine/tree/main/sdk/js">sdk/js</a> — <span>TypeScript light client: verify proofs in a browser</span></li>
+      <li><a href="https://github.com/peregrine-labs/peregrine/tree/main/crates/peregrine-interop">peregrine-interop</a> — <span>Ethereum verification and the zkVM boundary</span></li>
+      <li><a href="https://github.com/peregrine-labs/peregrine/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> — <span>how to build, test, and send a change</span></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Verify a read, in the browser</h2>
+    <p class="muted">
+      The TypeScript SDK reimplements proof checking independently of the node.
+      It understands both Merkle tree versions and <em>refuses</em> a version it
+      does not know rather than guessing — verifying under the wrong rule would
+      silently disagree with the chain.
+    </p>
+    <pre><code>import { verifyProvenRead, provenReadFromJson } from "@peregrine/sdk";
+
+const read = provenReadFromJson(await res.json());
+if (!verifyProvenRead(read, trustedStoreRoot)) {
+  throw new Error("the node lied");
+}</code></pre>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    Peregrine · Apache-2.0 · unaudited bootstrap scaffold ·
+    <a href="https://github.com/peregrine-labs/peregrine">github.com/peregrine-labs/peregrine</a>
+  </div>
+</footer>
+
+</body>
+</html>

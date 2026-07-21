@@ -24,16 +24,20 @@
 //! * **Dev TLS** (self-signed, skip-verify) — the transport is not the trust
 //!   boundary: proofs verify against the 32-byte store root and stream records
 //!   carry publisher signatures.
-//! * **No auth, quotas, or rate limits** — a public deployment needs stake- or
-//!   API-key-weighted admission control in front of `ingest_tx`.
+//! * **Admission control is per-connection only** ([`crate::rpc_limits`]):
+//!   weighted token-bucket rate limiting, a request size cap, and optional
+//!   bearer auth. That bounds what one client can push, but it is **not Sybil
+//!   resistance** — many connections get many buckets. A public deployment
+//!   needs stake- or key-weighted admission across connections.
 //! * Reads are served by **one** validator and reflect *its* committed
 //!   frontier; a client wanting cross-validator agreement should read from
 //!   several and compare roots.
 
 use crate::payload::WirePayload;
 use crate::quic::dev_endpoint;
+use crate::rpc_limits::{cost, RpcLimits, TokenBucket};
 use crate::validator::Query;
-use peregrine_sdk::protocol::{read_frame, write_frame, RpcRequest, RpcResponse};
+use peregrine_sdk::protocol::{read_frame, write_frame, RpcRequest, RpcResponse, MAX_CLAIM_BYTES};
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
@@ -70,6 +74,16 @@ pub fn serve(
     ingest_tx: mpsc::Sender<WirePayload>,
     query_tx: mpsc::Sender<Query>,
 ) -> anyhow::Result<RpcServer> {
+    serve_with_limits(bind, ingest_tx, query_tx, RpcLimits::default())
+}
+
+/// As [`serve`], with explicit admission control.
+pub fn serve_with_limits(
+    bind: SocketAddr,
+    ingest_tx: mpsc::Sender<WirePayload>,
+    query_tx: mpsc::Sender<Query>,
+    limits: RpcLimits,
+) -> anyhow::Result<RpcServer> {
     let endpoint = dev_endpoint(bind)?;
     let addr = endpoint.local_addr()?;
     let ep = endpoint.clone();
@@ -77,9 +91,10 @@ pub fn serve(
     let task = tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let (itx, qtx) = (ingest_tx.clone(), query_tx.clone());
+            let lim = limits.clone();
             tokio::spawn(async move {
                 match incoming.await {
-                    Ok(conn) => handle_conn(conn, itx, qtx).await,
+                    Ok(conn) => handle_conn(conn, itx, qtx, lim).await,
                     Err(e) => tracing::debug!("rpc handshake failed: {e}"),
                 }
             });
@@ -99,7 +114,10 @@ async fn handle_conn(
     conn: quinn::Connection,
     ingest_tx: mpsc::Sender<WirePayload>,
     query_tx: mpsc::Sender<Query>,
+    limits: RpcLimits,
 ) {
+    // One bucket per connection, shared across that connection's streams.
+    let bucket = std::sync::Arc::new(std::sync::Mutex::new(limits.bucket()));
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
@@ -107,8 +125,9 @@ async fn handle_conn(
             Err(_) => return,
         };
         let (itx, qtx) = (ingest_tx.clone(), query_tx.clone());
+        let (lim, bkt) = (limits.clone(), bucket.clone());
         tokio::spawn(async move {
-            if let Err(e) = serve_stream(send, recv, itx, qtx).await {
+            if let Err(e) = serve_stream(send, recv, itx, qtx, lim, bkt).await {
                 tracing::debug!("rpc stream ended: {e}");
             }
         });
@@ -120,13 +139,55 @@ async fn serve_stream(
     mut recv: quinn::RecvStream,
     ingest_tx: mpsc::Sender<WirePayload>,
     query_tx: mpsc::Sender<Query>,
+    limits: RpcLimits,
+    bucket: std::sync::Arc<std::sync::Mutex<TokenBucket>>,
 ) -> anyhow::Result<()> {
     let bytes = read_frame(&mut recv).await?;
+
+    // Size-check before deserializing: a request must not get to decide how
+    // much memory we allocate.
+    if bytes.len() > MAX_CLAIM_BYTES {
+        let resp = RpcResponse::Error(format!(
+            "request is {} bytes, limit is {MAX_CLAIM_BYTES}",
+            bytes.len()
+        ));
+        write_frame(&mut send, &bincode::serialize(&resp)?).await?;
+        send.finish()?;
+        return Ok(());
+    }
+
     let req: RpcRequest = bincode::deserialize(&bytes)?;
-    let resp = dispatch(req, &ingest_tx, &query_tx).await;
+
+    // Admission control, cheapest checks first.
+    let resp = if !limits.authorize(None) {
+        // Auth is configured but this transport carries no credential.
+        RpcResponse::Error("unauthorized".into())
+    } else if !spend(&bucket, request_cost(&req)) {
+        RpcResponse::Error("rate limit exceeded; retry shortly".into())
+    } else {
+        dispatch(req, &ingest_tx, &query_tx).await
+    };
     write_frame(&mut send, &bincode::serialize(&resp)?).await?;
     send.finish()?;
     Ok(())
+}
+
+/// What this request costs against the connection's budget.
+fn request_cost(req: &RpcRequest) -> u32 {
+    match req {
+        RpcRequest::Ping => cost::PING,
+        RpcRequest::ProveRead { .. } | RpcRequest::StoreRoot => cost::QUERY,
+        RpcRequest::Publish(_) | RpcRequest::SubmitTx(_) => cost::SUBMIT,
+        RpcRequest::SubmitClaim(_) => cost::CLAIM,
+    }
+}
+
+/// Spend from the shared bucket. A poisoned lock fails closed.
+fn spend(bucket: &std::sync::Mutex<TokenBucket>, cost: u32) -> bool {
+    bucket
+        .lock()
+        .map(|mut b| b.try_spend(cost))
+        .unwrap_or(false)
 }
 
 async fn dispatch(
@@ -142,6 +203,13 @@ async fn dispatch(
             accept(ingest_tx.send(WirePayload::TalonTx { program }).await)
         }
 
+        RpcRequest::SubmitClaim(claim) => {
+            // Straight onto the same ingest queue as everything else: the
+            // proof is verified during commit by every validator, not here.
+            // The RPC layer's job is admission control, not verification.
+            accept(ingest_tx.send(WirePayload::ForeignClaim(claim)).await)
+        }
+
         RpcRequest::ProveRead { table, key } => {
             let (reply, rx) = oneshot::channel();
             if query_tx
@@ -152,7 +220,7 @@ async fn dispatch(
                 return RpcResponse::Error("validator stopped".into());
             }
             match rx.await {
-                Ok(proof) => RpcResponse::Proof(proof),
+                Ok(proof) => RpcResponse::Proof(proof.map(Box::new)),
                 Err(_) => RpcResponse::Error("query dropped by validator".into()),
             }
         }

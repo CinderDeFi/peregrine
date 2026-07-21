@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Why Peregrine — verify, don't trust</title>
+<meta name="description" content="Blockchains order well and handle data badly, so apps read state through a provider they trust. Peregrine makes every read carry a proof, and proves cross-chain state instead of attesting to it." />
+<meta property="og:title" content="Why Peregrine" />
+<meta property="og:description" content="Every read carries a proof. Cross-chain state is proven, not attested. Absence is never zero." />
+<meta property="og:type" content="article" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%A6%85</text></svg>" />
+<style>
+  /* Same design system as index.html, kept inline so each page is a single
+     self-contained file — no shared stylesheet to get out of sync, no build
+     step, nothing fetched at render time. */
+  :root {
+    --bg: #fbfaf8; --fg: #16150f; --muted: #5d5b52; --line: #e2ded4;
+    --card: #ffffff; --accent: #9a3412; --accent-soft: #fdf1ea;
+    --code-bg: #f4f1ea; --warn: #8a5a00;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12110f; --fg: #edeae2; --muted: #a3a096; --line: #2b2924;
+      --card: #191713; --accent: #f0855a; --accent-soft: #241a15;
+      --code-bg: #1d1b16; --warn: #d9a84a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); line-height: 1.68; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+
+  header { border-bottom: 1px solid var(--line); }
+  nav { display: flex; align-items: center; gap: 20px; padding: 16px 0; flex-wrap: wrap; }
+  nav .brand { font-weight: 700; letter-spacing: .14em; font-size: .82rem; margin-right: auto; }
+  nav .brand a { color: var(--fg); text-decoration: none; }
+  nav a { font-size: .88rem; color: var(--muted); text-decoration: none; }
+  nav a:hover { color: var(--fg); }
+
+  h1 { font-size: clamp(2rem, 5.5vw, 2.9rem); line-height: 1.1; margin: 56px 0 .2em; letter-spacing: -.03em; }
+  .sub { font-family: var(--mono); color: var(--accent); font-size: .95rem; margin-bottom: 40px; }
+  h2 { font-size: 1.4rem; margin: 48px 0 .4em; letter-spacing: -.02em; }
+  h3 { font-size: 1.02rem; margin: 28px 0 .3em; }
+  p { max-width: 68ch; }
+  .muted { color: var(--muted); }
+
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; overflow-x: auto; font-family: var(--mono); font-size: .84rem; line-height: 1.6; }
+  code { font-family: var(--mono); font-size: .88em; }
+  p code, li code, td code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+  .note { background: var(--accent-soft); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 16px 18px; margin: 28px 0; }
+  .note p { margin: 0; font-size: .93rem; }
+
+  .table-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; min-width: 440px; margin: 8px 0; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+
+  blockquote { margin: 24px 0; padding: 4px 0 4px 20px; border-left: 3px solid var(--line); color: var(--muted); font-size: 1.02rem; }
+  footer { border-top: 1px solid var(--line); margin-top: 64px; padding: 32px 0 56px; color: var(--muted); font-size: .86rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <nav>
+      <span class="brand"><a href="./">PEREGRINE</a></span>
+      <a href="./#what">What it is</a>
+      <a href="./#try">Try it</a>
+      <a href="./#performance">Performance</a>
+      <a href="https://github.com/peregrine-labs/peregrine">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <h1>Why Peregrine</h1>
+  <div class="sub">verify, don't trust — at every boundary</div>
+
+  <p>
+    Blockchains are good at <em>ordering</em> and bad at <em>data</em>. That gap
+    is where most of the industry's trust quietly leaks back in, and Peregrine
+    is an attempt to close it in three specific places.
+  </p>
+
+  <div class="note">
+    <p>
+      <strong>Peregrine is an unaudited bootstrap scaffold.</strong> It has never
+      been deployed, holds no value, and has no token. What follows is an
+      argument about design, supported by measurements you can reproduce — not
+      a claim that it is ready to run anything real.
+    </p>
+  </div>
+
+  <h2>1. Reads are trust-me, and nobody says so</h2>
+
+  <p>
+    A blockchain's guarantees are real up to the node boundary. Past it, almost
+    every application asks an RPC provider what the state is and believes the
+    answer. Your users' security ends wherever that provider's integrity does.
+  </p>
+
+  <p>
+    Peregrine keeps state in sparse Merkle trees, and every read comes with an
+    inclusion proof. A client holding a 32-byte root verifies the value itself —
+    in a browser, with no node to trust:
+  </p>
+
+  <pre><code>const read = provenReadFromJson(await res.json());
+if (!verifyProvenRead(read, trustedStoreRoot)) {
+  throw new Error("the node lied");
+}</code></pre>
+
+  <p class="muted">
+    That verifier is written independently of the node, in TypeScript, and is
+    checked against Rust-generated fixtures in CI so the two implementations
+    cannot silently drift apart. A light client that verifies differently from
+    the chain is worse than no light client at all.
+  </p>
+
+  <h2>2. High-frequency data doesn't fit in a block</h2>
+
+  <p>
+    Price ticks, sensor readings, and telemetry arrive continuously. Blocks
+    designed for financial settlement are the wrong shape for them, so the data
+    gets pushed off-chain into exactly the oracles the chain was supposed to
+    replace.
+  </p>
+
+  <p>
+    Peregrine carries signed records <strong>inside consensus dissemination</strong>
+    rather than queueing them behind blocks. They commit to a deterministic
+    total order and materialize into queryable, provable tables. Measured on
+    four validators on a single laptop:
+  </p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Offered load</th><th>Committed</th><th>p50 publish→commit</th></tr></thead>
+      <tbody>
+        <tr><td>20,000 rec/s</td><td>19,993 rec/s</td><td>4.19 ms</td></tr>
+        <tr><td>flood</td><td>~34,000 rec/s</td><td>past the knee</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="muted" style="font-size:.9rem">
+    Loopback has no wide-area round-trip, so treat the latency as a floor rather
+    than a finality claim. Reproduce any row with <code>peregrine bench</code>.
+  </p>
+
+  <h2>3. Bridges are where the money goes missing</h2>
+
+  <p>
+    Most cross-chain systems are multisigs wearing a cryptography costume: a
+    committee attests that something happened on another chain, and you trust
+    the committee. The historical loss record speaks for itself.
+  </p>
+
+  <p>
+    Peregrine verifies Ethereum state <strong>inside a zkVM</strong>, and every
+    validator re-checks the proof at commit time — so acceptance is part of the
+    state transition, not something a relayer is trusted to have done. The guest
+    program's image is pinned, because a valid proof of a <em>different</em>
+    program is still a valid proof of something else.
+  </p>
+
+  <blockquote>
+    A real proof of Ethereum state verifies inside the commit path in <strong>52
+    ms</strong>. Proving takes minutes and happens once, off-chain, by whoever
+    wants the claim believed. Verification is milliseconds and happens on every
+    validator. That asymmetry is the whole design.
+  </blockquote>
+
+  <p class="muted">
+    It is tested against real mainnet data rather than hand-written vectors:
+    reproduced block hashes, real <code>eth_getProof</code> responses, and a real
+    510-of-512 BLS aggregate signature.
+  </p>
+
+  <h2>The rule underneath all of it: absence is never zero</h2>
+
+  <p>
+    A Peregrine contract that reads unverified Ethereum state does not get
+    <code>0</code> — the transaction <strong>traps</strong>. An on-chain read of
+    a key that was never proven does not return <code>0</code> — it
+    <strong>reverts</strong>.
+  </p>
+
+  <p>
+    This sounds pedantic until you notice how many real exploits are a system
+    confusing "I have no data" with "the value is zero": an under-collateralised
+    loan marked healthy because a balance read as zero, an oracle outage priced
+    as a crash. Missing data is an error. Making that impossible to ignore is
+    worth more than most features.
+  </p>
+
+  <h2>What we are not claiming</h2>
+
+  <p>
+    Peregrine has not been audited, deployed, or economically modelled.
+    Equivocation is detected but not slashed. RPC rate limiting bounds one
+    connection and is not Sybil resistance. Committee rotation for the
+    Ethereum-side client is not implemented.
+  </p>
+
+  <p>
+    The full list lives in
+    <a href="https://github.com/peregrine-labs/peregrine/blob/main/AUDIT.md">AUDIT.md</a>,
+    it is ranked by how much it should worry you, and it is longer than this
+    page. That is deliberate: a project asking you to verify rather than trust
+    should be the first to publish what it cannot yet prove.
+  </p>
+
+  <p>
+    <a href="https://github.com/peregrine-labs/peregrine">Read the code →</a>
+  </p>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    Peregrine · Apache-2.0 · unaudited bootstrap scaffold ·
+    <a href="https://github.com/peregrine-labs/peregrine">github.com/peregrine-labs/peregrine</a>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -20,12 +20,14 @@ use crate::pipeline::ExecutionPipeline;
 use crate::quic::{quic_cluster, QuicCluster};
 use crate::rpc::{self, RpcServer};
 use crate::store::Store;
+use crate::tiles::TilePool;
 use crate::validator::{run_validator, NodeReport, Query, ValidatorConfig};
 use anyhow::Context;
 use peregrine_core::{Committee, Keypair, ValidatorId, ValidatorInfo};
 use peregrine_data::streams::Publisher;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -137,6 +139,10 @@ impl Devnet {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut handles = Vec::with_capacity(opts.validators as usize);
+        // One tile pool shared by the in-process validators (see bench.rs for
+        // why sharing rather than one pool each).
+        let tiles = Arc::new(TilePool::sized_for_machine());
+
         // Validator 0's channels are the ones the RPC server drives.
         let mut rpc_channels = None;
 
@@ -144,7 +150,7 @@ impl Devnet {
             let id = node.id;
             let inbox = node.take_inbox();
             let net = node.broadcaster();
-            let mut pipeline = ExecutionPipeline::new();
+            let mut pipeline = ExecutionPipeline::new().with_tiles(Arc::clone(&tiles));
             pipeline.streams.register(&opts.stream, publisher_pk);
 
             // Each validator gets its own redb file when persistence is on, so

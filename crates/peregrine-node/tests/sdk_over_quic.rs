@@ -134,3 +134,112 @@ async fn sdk_drives_a_node_over_quic() {
     );
     let _ = DEMO_STREAM; // the devnet's pre-registered stream
 }
+
+// ── claim submission over RPC ───────────────────────────────────────────────
+
+/// Claims can now reach a node over the network, not just via in-process
+/// ingest. Acceptance into the queue is **not** acceptance of the claim: the
+/// proof is checked during commit by every validator, and this devnet runs the
+/// fail-closed default policy, so the claim must be dropped there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_can_be_submitted_over_rpc_but_still_must_verify() {
+    use peregrine_interop::zk::{Claim, Journal, NativeProver, Prover};
+
+    let devnet = Devnet::start().await.expect("devnet");
+    let client = Client::connect(devnet.rpc_addr).await.expect("connect");
+
+    let claim = NativeProver
+        .prove(Journal {
+            chain_id: 1,
+            block_number: 25_580_735,
+            block_hash: [0x11; 32],
+            state_root: [0x22; 32],
+            claim: Claim::Storage {
+                address: [0xc0; 20],
+                slot: [0x02; 32],
+                value: [0x12; 32],
+            },
+        })
+        .unwrap();
+
+    // The RPC accepts it into the ingest queue…
+    client
+        .submit_claim(claim)
+        .await
+        .expect("claim enters the ingest queue");
+
+    // …and consensus refuses it, because the devnet has no verifier and no
+    // anchors. Nothing lands in sys.eth_state.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let key = peregrine_node::pipeline::eth_state_key(1, &[0xc0; 20], &[0x02; 32]);
+    let stored = client
+        .prove_read(peregrine_node::pipeline::eth_state_table(), &key)
+        .await
+        .expect("query ok");
+    assert!(stored.is_none(), "an unproven claim must not become state");
+
+    let reports = devnet.shutdown().await.expect("shutdown");
+    assert!(
+        reports[0].pipeline.metrics.foreign_claims_rejected >= 1,
+        "the claim should have been seen and rejected during commit"
+    );
+    assert_eq!(
+        reports[0].pipeline.metrics.foreign_claims_applied, 0,
+        "and nothing should have been applied"
+    );
+}
+
+/// Rate limiting must actually bite: a flood of claims on one connection gets
+/// refused rather than filling the ingest queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claim_submission_is_rate_limited() {
+    use peregrine_interop::zk::{Claim, Journal, NativeProver, Prover};
+
+    let devnet = Devnet::start().await.expect("devnet");
+    let client = Client::connect(devnet.rpc_addr).await.expect("connect");
+
+    let make = |i: u8| {
+        let mut value = [0u8; 32];
+        value[31] = i;
+        NativeProver
+            .prove(Journal {
+                chain_id: 1,
+                block_number: 1,
+                block_hash: [0x11; 32],
+                state_root: [0x22; 32],
+                claim: Claim::Storage {
+                    address: [0xc0; 20],
+                    slot: [0x02; 32],
+                    value,
+                },
+            })
+            .unwrap()
+    };
+
+    let mut accepted = 0;
+    let mut refused = 0;
+    for i in 0..24u8 {
+        match client.submit_claim(make(i)).await {
+            Ok(()) => accepted += 1,
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(
+        accepted > 0,
+        "some claims should get through the burst allowance"
+    );
+    assert!(
+        refused > 0,
+        "a burst of {} claims must hit the limiter (accepted {accepted})",
+        24
+    );
+
+    // Cheap requests still work: the limiter throttles, it does not wedge the
+    // connection.
+    client
+        .ping()
+        .await
+        .expect("ping is cheap enough to still succeed");
+
+    devnet.shutdown().await.expect("shutdown");
+}

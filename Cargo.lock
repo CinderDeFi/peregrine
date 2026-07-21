@@ -622,6 +622,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_affinity"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "winapi",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2718,6 +2729,7 @@ dependencies = [
  "peregrine-sdk",
  "rand 0.8.7",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -2767,6 +2779,7 @@ dependencies = [
 name = "peregrine-interop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bincode",
  "blst",
  "hex",
@@ -2788,6 +2801,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "core_affinity",
+ "crossbeam-channel",
  "hex",
  "peregrine-consensus",
  "peregrine-core",

@@ -41,32 +41,82 @@
 // scoped to the backend module so a default build has no unused imports.
 use crate::zk::ZkError;
 
-/// Name of the guest package, used to locate its compiled ELF.
-pub const GUEST_PACKAGE: &str = "peregrine-eth-guest";
-/// Overrides where the guest ELF is read from.
-pub const GUEST_ELF_ENV: &str = "PEREGRINE_ETH_GUEST_ELF";
-
-/// Locate the guest ELF: `$PEREGRINE_ETH_GUEST_ELF`, else SP1's conventional
-/// build output path under the workspace target directory.
-pub fn guest_elf_path() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os(GUEST_ELF_ENV) {
-        return std::path::PathBuf::from(p);
-    }
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/elf-compilation/riscv32im-succinct-zkvm-elf/release")
-        .join(GUEST_PACKAGE)
+/// Which guest program to load.
+///
+/// There are two, one per direction, and they are **not** interchangeable: each
+/// proves a different statement and has its own verifying-key hash. Confusing
+/// them would yield a valid proof of the wrong thing, which is why the choice
+/// is an enum rather than a stringly-typed path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Guest {
+    /// Ethereum → Peregrine: verifies Ethereum headers and state proofs.
+    Eth,
+    /// Peregrine → Ethereum: verifies a quorum-signed checkpoint and a state
+    /// inclusion proof, committing an ABI-encoded journal for the EVM.
+    State,
 }
 
-/// Read the guest ELF from disk.
+impl Guest {
+    /// Cargo package name of the guest crate.
+    pub fn package(self) -> &'static str {
+        match self {
+            Guest::Eth => "peregrine-eth-guest",
+            Guest::State => "peregrine-state-guest",
+        }
+    }
+
+    /// Environment variable that overrides where its ELF is read from.
+    pub fn elf_env(self) -> &'static str {
+        match self {
+            Guest::Eth => "PEREGRINE_ETH_GUEST_ELF",
+            Guest::State => "PEREGRINE_STATE_GUEST_ELF",
+        }
+    }
+
+    /// Locate the ELF: the override env var, else SP1's conventional build
+    /// output path under the guest crate's own target directory.
+    pub fn elf_path(self) -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os(self.elf_env()) {
+            return std::path::PathBuf::from(p);
+        }
+        // Each guest is its own workspace, so its artefacts land under its own
+        // `target/`, not the root one.
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(self.package())
+            .join("target/elf-compilation/riscv64im-succinct-zkvm-elf/release")
+            .join(self.package())
+    }
+
+    /// Read the ELF from disk.
+    pub fn load_elf(self) -> Result<Vec<u8>, ZkError> {
+        let path = self.elf_path();
+        std::fs::read(&path).map_err(|e| {
+            ZkError::Invalid(format!(
+                "guest ELF not found at {} ({e}). Build it with `cd crates/{} && \
+                 cargo prove build`, or set {}.",
+                path.display(),
+                self.package(),
+                self.elf_env()
+            ))
+        })
+    }
+}
+
+/// Name of the Ethereum guest package. Retained for callers written before
+/// there were two guests.
+pub const GUEST_PACKAGE: &str = "peregrine-eth-guest";
+/// Overrides where the Ethereum guest ELF is read from.
+pub const GUEST_ELF_ENV: &str = "PEREGRINE_ETH_GUEST_ELF";
+
+/// Locate the Ethereum guest ELF.
+pub fn guest_elf_path() -> std::path::PathBuf {
+    Guest::Eth.elf_path()
+}
+
+/// Read the Ethereum guest ELF from disk.
 pub fn load_guest_elf() -> Result<Vec<u8>, ZkError> {
-    let path = guest_elf_path();
-    std::fs::read(&path).map_err(|e| {
-        ZkError::Invalid(format!(
-            "guest ELF not found at {} ({e}). Build it with \
-             `cd crates/peregrine-eth-guest && cargo prove build`, or set {GUEST_ELF_ENV}.",
-            path.display()
-        ))
-    })
+    Guest::Eth.load_elf()
 }
 
 #[cfg(feature = "sp1")]
@@ -74,7 +124,11 @@ mod imp {
     use super::*;
     use crate::witness::{decode_journal, encode_journal, Witness};
     use crate::zk::{Journal, Proof, ProofSystem, Prover, VerifiedClaim, Verifier, B256};
-    use sp1_sdk::{ProverClient, SP1Stdin};
+    // SP1 v6's default `ProverClient` is async. The blocking client keeps proof
+    // verification off the async runtime, which matters because a validator
+    // verifies claims inside its synchronous commit path.
+    use sp1_sdk::blocking::{ProveRequest, Prover as _, ProverClient};
+    use sp1_sdk::{Elf, HashableKey, ProvingKey as _, SP1ProofMode, SP1Stdin, SP1VerifyingKey};
 
     /// Proof shape to generate.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +144,15 @@ mod imp {
         Groth16,
     }
 
+    impl Sp1Mode {
+        fn to_proof_mode(self) -> SP1ProofMode {
+            match self {
+                Sp1Mode::Compressed => SP1ProofMode::Compressed,
+                Sp1Mode::Groth16 => SP1ProofMode::Groth16,
+            }
+        }
+    }
+
     /// Generates real SP1 proofs.
     pub struct Sp1Prover {
         elf: Vec<u8>,
@@ -97,40 +160,47 @@ mod imp {
     }
 
     impl Sp1Prover {
-        /// Load the guest ELF and prepare a prover.
+        /// Load the **Ethereum** guest ELF and prepare a prover.
         pub fn new(mode: Sp1Mode) -> Result<Self, ZkError> {
+            Self::for_guest(Guest::Eth, mode)
+        }
+
+        /// Load a named guest's ELF and prepare a prover.
+        pub fn for_guest(guest: Guest, mode: Sp1Mode) -> Result<Self, ZkError> {
             Ok(Self {
-                elf: load_guest_elf()?,
+                elf: guest.load_elf()?,
                 mode,
             })
         }
 
         /// The verifying-key hash for the loaded guest — the value to pin.
         ///
-        /// Print it with `peregrine interop image-id` and paste it into your
-        /// configuration; a node should never learn its expected image id from
-        /// the same party that supplies proofs.
+        /// A node should never learn its expected image id from the same party
+        /// that supplies its proofs; derive it from your own build.
         pub fn image_id(&self) -> Result<B256, ZkError> {
             let client = ProverClient::from_env();
-            let (_, vk) = client.setup(&self.elf);
-            vkey_to_image_id(&vk)
+            let pk = client
+                .setup(Elf::from(self.elf.as_slice()))
+                .map_err(|e| ZkError::Invalid(format!("setup failed: {e}")))?;
+            vkey_to_image_id(pk.verifying_key())
         }
 
         /// Prove a witness. The journal is whatever the *guest* committed, not
         /// anything we computed here.
         pub fn prove_witness(&self, witness: &Witness) -> Result<VerifiedClaim, ZkError> {
             let client = ProverClient::from_env();
-            let (pk, vk) = client.setup(&self.elf);
+            let pk = client
+                .setup(Elf::from(self.elf.as_slice()))
+                .map_err(|e| ZkError::Invalid(format!("setup failed: {e}")))?;
 
             let mut stdin = SP1Stdin::new();
             stdin.write(witness);
 
-            let builder = client.prove(&pk, &stdin);
-            let proof = match self.mode {
-                Sp1Mode::Compressed => builder.compressed().run(),
-                Sp1Mode::Groth16 => builder.groth16().run(),
-            }
-            .map_err(|e| ZkError::Invalid(format!("proving failed: {e}")))?;
+            let proof = client
+                .prove(&pk, stdin)
+                .mode(self.mode.to_proof_mode())
+                .run()
+                .map_err(|e| ZkError::Invalid(format!("proving failed: {e}")))?;
 
             // Read the statement back out of the proof rather than trusting our
             // own local computation of it.
@@ -143,9 +213,80 @@ mod imp {
                 journal,
                 proof: Proof::Zk {
                     system: ProofSystem::Sp1,
-                    image_id: vkey_to_image_id(&vk)?,
+                    image_id: vkey_to_image_id(pk.verifying_key())?,
                     bytes,
                 },
+            })
+        }
+    }
+
+    /// A proof of Peregrine state, in the form an EVM contract consumes.
+    ///
+    /// Deliberately *not* a [`VerifiedClaim`]: that type carries an
+    /// Ethereum-side `Journal` and is verified inside Peregrine. This one is
+    /// verified by Solidity, so it carries the raw ABI-encoded public values
+    /// and the raw proof bytes — exactly the two `bytes` arguments
+    /// `verifyPeregrineState` takes, and nothing else.
+    #[derive(Clone, Debug)]
+    pub struct StateProof {
+        /// The decoded statement, for inspection and assertions.
+        pub journal: crate::state::StateJournal,
+        /// ABI-encoded public values — `publicValues` on-chain.
+        pub public_values: Vec<u8>,
+        /// Proof bytes in the encoding SP1's on-chain verifier expects —
+        /// `proofBytes` on-chain.
+        pub proof_bytes: Vec<u8>,
+        /// Verifying-key hash of the guest — `programVKey` on-chain.
+        pub image_id: B256,
+    }
+
+    impl Sp1Prover {
+        /// Prove a Peregrine state witness for on-chain verification.
+        ///
+        /// The mode matters here in a way it does not elsewhere: SP1's EVM
+        /// verifier accepts **Groth16** (or PLONK), not a compressed STARK. A
+        /// compressed proof is still a real proof — it just cannot be checked
+        /// by the contract — so this refuses rather than producing bytes that
+        /// would fail on-chain for reasons no one could diagnose from the
+        /// revert.
+        pub fn prove_state(
+            &self,
+            witness: &crate::state::StateWitness,
+        ) -> Result<StateProof, ZkError> {
+            if self.mode != Sp1Mode::Groth16 {
+                return Err(ZkError::Invalid(
+                    "on-chain verification needs Groth16; a Compressed proof cannot be \
+                     verified by SP1's EVM verifier"
+                        .into(),
+                ));
+            }
+
+            let client = ProverClient::from_env();
+            let pk = client
+                .setup(Elf::from(self.elf.as_slice()))
+                .map_err(|e| ZkError::Invalid(format!("setup failed: {e}")))?;
+
+            let mut stdin = SP1Stdin::new();
+            stdin.write(witness);
+
+            let proof = client
+                .prove(&pk, stdin)
+                .mode(SP1ProofMode::Groth16)
+                .run()
+                .map_err(|e| ZkError::Invalid(format!("proving failed: {e}")))?;
+
+            // Read the statement back out of the proof rather than trusting our
+            // own local computation of it — the guest is the authority on what
+            // was proved.
+            let public_values = proof.public_values.as_slice().to_vec();
+            let journal = crate::state::decode_state_journal(&public_values)
+                .map_err(|e| ZkError::Invalid(e.to_string()))?;
+
+            Ok(StateProof {
+                journal,
+                public_values,
+                proof_bytes: proof.bytes(),
+                image_id: vkey_to_image_id(pk.verifying_key())?,
             })
         }
     }
@@ -162,20 +303,54 @@ mod imp {
     }
 
     /// Verifies SP1 proofs against a pinned program image.
+    ///
+    /// The verifying key is derived **once**, at construction. Deriving it is
+    /// far more expensive than checking a proof against it, so doing it per
+    /// call would put seconds of avoidable work on the commit path — and the
+    /// ELF is fixed for the verifier's lifetime anyway.
+    ///
+    /// Construction also fails if the local ELF does not hash to the pinned
+    /// image id, so a misconfigured node refuses to start rather than
+    /// discovering the mismatch mid-consensus.
     pub struct Sp1Verifier {
-        elf: Vec<u8>,
+        client: sp1_sdk::blocking::EnvProver,
+        vk: SP1VerifyingKey,
         expected_image_id: B256,
         expected_chain_id: u64,
     }
 
     impl Sp1Verifier {
         pub fn new(expected_image_id: B256, expected_chain_id: u64) -> Result<Self, ZkError> {
+            let elf = load_guest_elf()?;
+            let client = ProverClient::from_env();
+            let pk = client
+                .setup(Elf::from(elf.as_slice()))
+                .map_err(|e| ZkError::Invalid(format!("setup failed: {e}")))?;
+            let vk = pk.verifying_key().clone();
+            let actual = vkey_to_image_id(&vk)?;
+            if actual != expected_image_id {
+                return Err(ZkError::Invalid(format!(
+                    "local guest ELF has image id 0x{} but 0x{} was pinned",
+                    short_hex(&actual),
+                    short_hex(&expected_image_id)
+                )));
+            }
             Ok(Self {
-                elf: load_guest_elf()?,
+                client,
+                vk,
                 expected_image_id,
                 expected_chain_id,
             })
         }
+
+        /// The pinned program image this verifier accepts.
+        pub fn image_id(&self) -> B256 {
+            self.expected_image_id
+        }
+    }
+
+    fn short_hex(b: &B256) -> String {
+        b[..4].iter().map(|x| format!("{x:02x}")).collect()
     }
 
     impl Verifier for Sp1Verifier {
@@ -216,22 +391,16 @@ mod imp {
                 return Err(ZkError::JournalMismatch);
             }
 
-            // (1) And finally the cryptography.
-            let client = ProverClient::from_env();
-            let (_, vk) = client.setup(&self.elf);
-            if vkey_to_image_id(&vk)? != self.expected_image_id {
-                return Err(ZkError::Invalid(
-                    "local guest ELF does not match the pinned image id".into(),
-                ));
-            }
-            client
-                .verify(&proof, &vk)
+            // (1) And finally the cryptography, against the key derived — and
+            // checked against the pin — at construction time.
+            self.client
+                .verify(&proof, &self.vk, None)
                 .map_err(|e| ZkError::Invalid(format!("SP1 proof rejected: {e}")))
         }
     }
 
     /// SP1's verifying-key hash, as 32 bytes — our `image_id`.
-    fn vkey_to_image_id(vk: &sp1_sdk::SP1VerifyingKey) -> Result<B256, ZkError> {
+    fn vkey_to_image_id(vk: &SP1VerifyingKey) -> Result<B256, ZkError> {
         let s = vk.bytes32();
         let hex = s.trim_start_matches("0x");
         let raw = (0..hex.len())
@@ -252,7 +421,7 @@ mod imp {
 }
 
 #[cfg(feature = "sp1")]
-pub use imp::{Sp1Mode, Sp1Prover, Sp1Verifier};
+pub use imp::{Sp1Mode, Sp1Prover, Sp1Verifier, StateProof};
 
 #[cfg(test)]
 mod tests {

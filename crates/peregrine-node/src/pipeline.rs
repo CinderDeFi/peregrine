@@ -14,15 +14,17 @@
 //! simulation asserts exactly that.
 
 use crate::payload::WirePayload;
+use crate::tiles::TilePool;
 use peregrine_consensus::{CommitObserver, Dag};
 use peregrine_core::{Hash, Round};
 use peregrine_data::fees::{DualMeter, FeeSchedule, FeeSplit};
 use peregrine_data::streams::{StreamId, StreamRegistry, SubscriberHandle};
-use peregrine_data::tables::{ProvenRead, TableId, TableStore};
+use peregrine_data::tables::{ProvenRead, TableId, TableStore, TreeVersion};
 use peregrine_interop::beacon::AnchorStore;
 use peregrine_interop::zk::Claim;
 use peregrine_interop::{VerifiedClaim, Verifier};
 use peregrine_vm::{Host, ProvenValue, Vm};
+use std::sync::Arc;
 
 /// Table that materializes committed stream records: key = (stream, seq).
 pub fn ticks_table() -> TableId {
@@ -81,6 +83,10 @@ impl LatencyHistogram {
 /// Rolling metrics for the demo/report.
 #[derive(Debug, Default, Clone)]
 pub struct PipelineMetrics {
+    /// Times the store migrated Merkle versions. Should be exactly 0 or 1 in
+    /// a node's lifetime; anything higher means the activation rule is firing
+    /// repeatedly and roots are churning.
+    pub merkle_migrations: u64,
     pub committed_vertices: u64,
     pub committed_records: u64,
     pub committed_txs: u64,
@@ -132,6 +138,24 @@ pub fn eth_state_key(chain_id: u64, address: &[u8; 20], slot: &[u8; 32]) -> Vec<
     key
 }
 
+/// Foreign-chain claims verified per commit batch.
+///
+/// Proof verification is orders of magnitude more expensive than anything else
+/// on the commit path, so it must be bounded or a single vertex stuffed with
+/// claims becomes a consensus-halting DoS. The cap is applied identically on
+/// every validator (counted per commit batch, reset at the start of each), so
+/// which claims are accepted stays a deterministic function of the committed
+/// order — the bound cannot itself cause a fork.
+pub const MAX_CLAIMS_PER_COMMIT: u32 = 4;
+
+/// Compute units charged for attempting to verify one foreign claim.
+///
+/// Priced far above ordinary execution because it *is* far more expensive.
+/// Charged whether or not verification succeeds — unpriced verification is a
+/// denial-of-service vector, and an attacker must not get free proof-checking
+/// by submitting garbage.
+pub const CU_VERIFY_CLAIM: u64 = 500_000;
+
 /// How this node decides whether a foreign claim is acceptable.
 ///
 /// **This is a consensus rule, not a local preference.** Validators that
@@ -147,6 +171,44 @@ pub enum ClaimPolicy {
         verifier: Box<dyn Verifier + Send + Sync>,
         chain_id: u64,
     },
+}
+
+impl ClaimPolicy {
+    /// Accept only real SP1 proofs of the pinned guest program.
+    ///
+    /// This is the configuration a production validator runs. It fails to
+    /// construct if the local guest ELF does not hash to `image_id`, so a
+    /// misconfigured node refuses to start rather than silently disagreeing
+    /// with its peers about which proofs are valid — which would fork the
+    /// chain.
+    ///
+    /// Obtain `image_id` from **your own** build of the guest
+    /// (`cargo prove build`), never from whoever supplies you proofs.
+    #[cfg(feature = "sp1")]
+    pub fn sp1(image_id: [u8; 32], chain_id: u64) -> Result<Self, String> {
+        let verifier = peregrine_interop::Sp1Verifier::new(image_id, chain_id)
+            .map_err(|e| format!("SP1 verifier unavailable: {e}"))?;
+        Ok(ClaimPolicy::Verified {
+            verifier: Box::new(verifier),
+            chain_id,
+        })
+    }
+
+    /// Accept claims a strict verifier approves, without a proving backend
+    /// compiled in.
+    ///
+    /// This rejects *everything* — `Proof::Native` for carrying no
+    /// cryptographic argument, and `Proof::Zk` because no backend can check
+    /// it. That is the correct default for a build without `--features sp1`:
+    /// a node that cannot verify must not accept.
+    pub fn strict(image_id: [u8; 32], chain_id: u64) -> Self {
+        ClaimPolicy::Verified {
+            verifier: Box::new(peregrine_interop::zk::StrictVerifier {
+                expected_image_id: image_id,
+            }),
+            chain_id,
+        }
+    }
 }
 
 impl std::fmt::Debug for ClaimPolicy {
@@ -175,6 +237,25 @@ pub struct ExecutionPipeline {
     /// beacon light-client updates. **A claim is only accepted if its block is
     /// in here**, so an empty store rejects everything.
     pub anchors: AnchorStore,
+    /// Claims verified so far in the current commit batch (see
+    /// [`MAX_CLAIMS_PER_COMMIT`]). Reset at the start of every batch.
+    claims_this_commit: u32,
+    /// Round at which this node switches its table store to the
+    /// path-compressed v2 Merkle rule, or `None` to stay on v1 forever.
+    ///
+    /// **This is a consensus rule, not a local setting.** Every validator must
+    /// carry the same activation round, or they will commit different store
+    /// roots for identical state from that round on and the chain forks. It
+    /// belongs in genesis/config and changes only by coordinated upgrade —
+    /// exactly like `ClaimPolicy`.
+    pub merkle_v2_activation: Option<Round>,
+    /// Optional sig-verify tiles. `None` → everything verifies inline, which is
+    /// the old behaviour and what the determinism tests use.
+    ///
+    /// **Not a consensus input.** The tiles change *where* signature checks run,
+    /// never what they decide, so two validators configured with different tile
+    /// counts (or none) commit identical state. See [`crate::tiles`].
+    tiles: Option<Arc<TilePool>>,
 }
 
 impl ExecutionPipeline {
@@ -191,7 +272,63 @@ impl ExecutionPipeline {
             metrics: PipelineMetrics::default(),
             claim_policy: ClaimPolicy::RejectAll,
             anchors: AnchorStore::new(256),
+            claims_this_commit: 0,
+            merkle_v2_activation: None,
+            tiles: None,
         }
+    }
+
+    /// Schedule the v2 Merkle upgrade at `round`.
+    ///
+    /// Migration happens at the **first commit whose anchor round is at or past
+    /// `round`**, before that batch's payloads are applied. Keying it to the
+    /// committed round — rather than to wall-clock time, node start, or an
+    /// operator command — is what makes it deterministic: every honest
+    /// validator sees the same committed sequence, so every one migrates at the
+    /// same point in that sequence and they all agree on every root thereafter.
+    pub fn with_merkle_v2_at(mut self, round: Round) -> Self {
+        self.merkle_v2_activation = Some(round);
+        self
+    }
+
+    /// Drive the activation check for `round` without a full commit.
+    ///
+    /// Public so the upgrade can be tested at the rounds that matter — before,
+    /// at, and after activation — without standing up a network for each. It is
+    /// the same function `on_commit` calls, so a test here is a test of the
+    /// real rule and not of a parallel reimplementation.
+    pub fn migrate_for_round(&mut self, round: Round) -> bool {
+        self.maybe_migrate(round)
+    }
+
+    /// Migrate now if this round activates the upgrade. Idempotent.
+    ///
+    /// Returns `true` if the migration ran on this call.
+    fn maybe_migrate(&mut self, round: Round) -> bool {
+        let Some(at) = self.merkle_v2_activation else {
+            return false;
+        };
+        if round < at || self.tables.version() == TreeVersion::V2 {
+            return false;
+        }
+        let before = self.tables.store_root();
+        let after = self.tables.migrate_to_v2();
+        self.metrics.merkle_migrations += 1;
+        tracing::info!(
+            round,
+            activation = at,
+            root_before = %before,
+            root_after = %after,
+            "migrated table store to path-compressed Merkle (v2) — store root              changes by design; light clients must re-pin"
+        );
+        true
+    }
+
+    /// Attach a sig-verify tile pool. Purely a performance choice; see the
+    /// field docs for why it cannot affect committed state.
+    pub fn with_tiles(mut self, tiles: Arc<TilePool>) -> Self {
+        self.tiles = Some(tiles);
+        self
     }
 
     pub fn subscribe(&self, id: &StreamId) -> Option<SubscriberHandle> {
@@ -219,6 +356,14 @@ impl ExecutionPipeline {
     /// called out in the README. Until an anchoring source exists, a node
     /// should run [`ClaimPolicy::RejectAll`] in production.
     pub fn apply_foreign_claim(&mut self, claim: &VerifiedClaim) -> Result<bool, String> {
+        // Bound the verification work in this batch before doing any of it.
+        if self.claims_this_commit >= MAX_CLAIMS_PER_COMMIT {
+            return Err(format!(
+                "claim budget exhausted ({MAX_CLAIMS_PER_COMMIT} per commit); resubmit later"
+            ));
+        }
+        self.claims_this_commit += 1;
+
         let (verifier, chain_id) = match &self.claim_policy {
             ClaimPolicy::RejectAll => {
                 return Err("node policy rejects foreign claims (no verifier configured)".into())
@@ -261,12 +406,105 @@ impl ExecutionPipeline {
         }
     }
 
-    fn apply_item(&mut self, bytes: &[u8]) {
-        let Some(payload) = WirePayload::decode(bytes) else {
-            tracing::warn!("undecodable payload item ({} bytes) — skipped", bytes.len());
-            return;
-        };
-        self.apply_payload(&payload);
+    /// Apply an already-decoded, already-ordered batch: verify in parallel,
+    /// then apply serially.
+    ///
+    /// Public because it is the real commit path, and a test that drove
+    /// `apply_payload` in a loop instead would silently bypass the tiles and
+    /// prove nothing about them. Callers must pass payloads in committed order;
+    /// this function preserves it.
+    pub fn apply_decoded_batch(&mut self, decoded: &[WirePayload]) {
+        // ── phase 2: signature verification (parallel across tiles) ─────────
+        // Pure predicates over each shred, so they can run anywhere. Verdicts
+        // come back indexed by position and are consumed in committed order,
+        // which is what keeps this deterministic regardless of tile count.
+        let verdicts = self.verify_shreds(decoded);
+
+        // ── phase 3: apply (serial, ordered — the state transition) ─────────
+        for (i, payload) in decoded.iter().enumerate() {
+            match payload {
+                WirePayload::Shred(shred) => self.apply_shred(shred, verdicts[i]),
+                other => self.apply_payload(other),
+            }
+        }
+    }
+
+    /// Verify every shred in a decoded batch, using the tiles when attached.
+    ///
+    /// Returns a verdict per element of `decoded`, positionally. Non-shred
+    /// entries get `false`, which is never read — only [`WirePayload::Shred`]
+    /// consults its verdict.
+    fn verify_shreds(&self, decoded: &[WirePayload]) -> Vec<bool> {
+        let mut verdicts = vec![false; decoded.len()];
+
+        // Build the job list. A shred whose stream is unknown gets no job: it
+        // will be rejected by `apply_committed_with` anyway, and dispatching a
+        // verification for it would be wasted work.
+        let mut jobs = Vec::new();
+        for (i, p) in decoded.iter().enumerate() {
+            if let WirePayload::Shred(shred) = p {
+                if let Some(pk) = self.streams.publisher_key_for(shred) {
+                    jobs.push(crate::tiles::VerifyJob {
+                        index: i,
+                        public_key: pk,
+                        domain: peregrine_data::streams::STREAM_DOMAIN,
+                        message: StreamRegistry::signing_bytes_of(shred),
+                        signature: shred.signature,
+                    });
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return verdicts;
+        }
+
+        match &self.tiles {
+            Some(pool) => {
+                // `verify_batch` returns a full-length positional vector, so
+                // indices line up with `decoded` directly.
+                let results = pool.verify_batch_indexed(jobs, decoded.len());
+                verdicts = results;
+            }
+            None => {
+                for job in &jobs {
+                    verdicts[job.index] = peregrine_core::crypto::verify(
+                        &job.public_key,
+                        job.domain,
+                        &job.message,
+                        &job.signature,
+                    )
+                    .is_ok();
+                }
+            }
+        }
+        verdicts
+    }
+
+    /// Apply one committed shred given its precomputed signature verdict.
+    fn apply_shred(&mut self, shred: &peregrine_data::streams::StreamShred, sig_ok: bool) {
+        let mut meter = DualMeter::default();
+        match self.streams.apply_committed_with(shred, sig_ok) {
+            Ok(data_bytes) => {
+                meter.tick_data(data_bytes);
+                let mut key = Vec::with_capacity(40);
+                key.extend_from_slice(&shred.record.stream.0 .0);
+                key.extend_from_slice(&shred.record.seq.to_be_bytes());
+                meter.tick_data((key.len() + shred.record.payload.len()) as u64);
+                self.tables
+                    .insert(ticks_table(), key, shred.record.payload.clone());
+
+                self.metrics.committed_records += 1;
+                let now = now_ns();
+                let latency = now.saturating_sub(shred.record.timestamp_ns);
+                self.metrics.record_latency_ns_sum += latency as u128;
+                self.metrics.latency.record(latency);
+            }
+            Err(e) => tracing::warn!("rejected shred: {e}"),
+        }
+        // Same settlement as every other payload kind: work is priced whether
+        // or not it was accepted.
+        let quote = self.fee_schedule.quote(&meter);
+        self.fee_split.settle(&quote);
     }
 
     /// Apply one decoded payload — the unit of work inside a committed vertex.
@@ -301,10 +539,12 @@ impl ExecutionPipeline {
             WirePayload::ForeignClaim(claim) => {
                 // Verification runs on every validator, so acceptance is part
                 // of the state transition rather than something a relayer is
-                // trusted to have done. The claim is metered for its proof
-                // bytes whether or not it is accepted — verifying costs real
-                // work, and unpriced verification is a DoS vector.
+                // trusted to have done. Metered on *both* meters whether or not
+                // it is accepted: the proof's bytes on the data meter, and the
+                // verification itself on the compute meter. Unpriced
+                // verification is a denial-of-service vector.
                 meter.tick_data(bincode::serialized_size(&claim).unwrap_or(0));
+                meter.tick_compute(CU_VERIFY_CLAIM);
                 match self.apply_foreign_claim(&claim) {
                     Ok(true) => self.metrics.foreign_claims_applied += 1,
                     Ok(false) => {}
@@ -340,15 +580,40 @@ impl Default for ExecutionPipeline {
 }
 
 impl CommitObserver for ExecutionPipeline {
-    fn on_commit(&mut self, _round: Round, _anchor: Hash, ordered: &[Hash], dag: &Dag) {
+    fn on_commit(&mut self, round: Round, _anchor: Hash, ordered: &[Hash], dag: &Dag) {
         self.metrics.commit_rounds += 1;
+        // Fresh proof-verification budget for this batch. Every validator
+        // resets at the same point in the committed order, so the bound is
+        // deterministic.
+        self.claims_this_commit = 0;
+
+        // ── phase 1: decode (serial, cheap) ─────────────────────────────────
+        // Decoding is ~0.2 µs/item and allocates; doing it once here means the
+        // serial apply loop below never re-parses, and it gives us the shred
+        // list the verify tiles need.
+        let mut decoded: Vec<WirePayload> = Vec::new();
         for h in ordered {
             let Some(vertex) = dag.get(h) else { continue };
             self.metrics.committed_vertices += 1;
             for item in &vertex.payload.items {
-                self.apply_item(&item.0);
+                match WirePayload::decode(&item.0) {
+                    Some(p) => decoded.push(p),
+                    None => tracing::warn!(
+                        "undecodable payload item ({} bytes) — skipped",
+                        item.0.len()
+                    ),
+                }
             }
         }
+
+        // The upgrade happens *before* this batch is applied, so the boundary
+        // is unambiguous: everything committed at or after the activation round
+        // is authenticated under v2. Applying first and migrating after would
+        // leave the same round meaning different things on different nodes
+        // depending on ordering.
+        self.maybe_migrate(round);
+
+        self.apply_decoded_batch(&decoded);
     }
 }
 

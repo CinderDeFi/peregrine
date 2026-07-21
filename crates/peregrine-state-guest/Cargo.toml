@@ -1,0 +1,26 @@
+# SP1 guest program. Deliberately NOT a member of the root workspace: it
+# compiles for `riscv32im-succinct-zkvm-elf` with the Succinct toolchain, so
+# `cargo test --workspace` on the host must not try to build it.
+[workspace]
+
+[package]
+name = "peregrine-state-guest"
+description = "SP1 guest: verifies a quorum-signed Peregrine checkpoint and a state inclusion proof, committing an ABI-encoded journal for the EVM."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+# The verification logic itself — the same code the host runs natively. No
+# `sp1` feature: the core is pure and has no zkVM dependency.
+peregrine-interop = { path = "../peregrine-interop" }
+sp1-zkvm = "6.3"
+
+[profile.release]
+# Guest programs are always built in release; these keep the ELF small and
+# deterministic, which matters because the ELF *is* the thing the EVM contract
+# pins as `programVKey`.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

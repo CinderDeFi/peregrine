@@ -15,10 +15,12 @@ use crate::network::{local_network, Broadcaster, Inbox};
 use crate::payload::WirePayload;
 use crate::pipeline::ExecutionPipeline;
 use crate::quic::{quic_cluster, QuicCluster};
+use crate::tiles::TilePool;
 use crate::validator::{run_validator, NodeReport, ValidatorConfig};
 use anyhow::Result;
 use peregrine_core::{Committee, Keypair, ValidatorId, ValidatorInfo};
 use peregrine_data::streams::Publisher;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
@@ -115,13 +117,28 @@ pub async fn run(opts: BenchOptions) -> Result<()> {
         }
     }
 
+    // One tile pool shared by every validator in this process.
+    //
+    // Sharing is right for a benchmark: N in-process validators on one machine
+    // are simulating N machines, so giving each its own pool would oversubscribe
+    // the cores and measure scheduler thrash rather than the pipeline. A real
+    // deployment runs one validator per host and gets the whole pool to itself.
+    let tiles = Arc::new(TilePool::sized_for_machine());
+
     // Spawn validators.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut ingest_txs = Vec::with_capacity(validators as usize);
     let mut handles = Vec::with_capacity(validators as usize);
     for (kp, (inbox, net)) in keypairs.into_iter().zip(endpoints) {
         let id = inbox.id;
-        let mut pipeline = ExecutionPipeline::new();
+        let mut pipeline = ExecutionPipeline::new().with_tiles(Arc::clone(&tiles));
+        // `PEREGRINE_MERKLE_V2=1` schedules the upgrade at round 0, so the run
+        // exercises the real activation path rather than a special-cased
+        // constructor. Same binary, both formats — which is the only way to
+        // compare them without confounding the tree change with a rebuild.
+        if std::env::var("PEREGRINE_MERKLE_V2").as_deref() == Ok("1") {
+            pipeline = pipeline.with_merkle_v2_at(0);
+        }
         for (i, p) in publishers.iter().enumerate() {
             pipeline
                 .streams
@@ -222,6 +239,7 @@ pub async fn run(opts: BenchOptions) -> Result<()> {
     report(
         &transport,
         validators,
+        &tiles,
         elapsed,
         total_published,
         &mut reports,
@@ -232,6 +250,7 @@ pub async fn run(opts: BenchOptions) -> Result<()> {
 fn report(
     transport: &str,
     validators: u16,
+    tiles: &TilePool,
     elapsed: Duration,
     published: u64,
     reports: &mut [NodeReport],
@@ -246,6 +265,22 @@ fn report(
     println!("\n════════════════════ peregrine-bench ════════════════════");
     println!("transport            : {transport}");
     println!("validators           : {validators}");
+    println!(
+        "sigverify tiles      : {} ({} jobs, {} batches, {} inline)",
+        tiles.tiles(),
+        tiles
+            .metrics
+            .jobs
+            .load(std::sync::atomic::Ordering::Relaxed),
+        tiles
+            .metrics
+            .batches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        tiles
+            .metrics
+            .inline_batches
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
     println!("window               : {secs:.2}s");
     println!("records published    : {published}");
     println!("records committed    : {committed}");

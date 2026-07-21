@@ -11,6 +11,21 @@ production software. Nothing in this repository should hold value.
 | Formal verification | ❌ none |
 | Testnet / mainnet deployment | ❌ never deployed |
 | Bug bounty | ❌ not yet |
+| Static analysis (Slither) | ✅ clean on the shipped contract — see [`contracts/SLITHER.md`](contracts/SLITHER.md) |
+| EVM contract test suite | ✅ 41 Foundry tests incl. fuzzing — see [`contracts/AUDIT.md`](contracts/AUDIT.md) |
+| Audit package | ✅ prepared — see [`AUDIT.md`](AUDIT.md) |
+| Coverage-guided fuzzing (Rust) | ❌ none — property tests only |
+| Formal verification | ❌ none |
+
+**[`AUDIT.md`](AUDIT.md) is the entry point for reviewers**: scope, trust
+boundaries, sixteen named invariants, a threat model, and a ranked list of what
+to attack first. It exists to make an audit efficient, not to suggest one has
+happened.
+
+A clean static-analysis run is **not** an audit. Slither finds pattern-level
+defects; it cannot tell you whether the right committee is pinned or whether
+the Rust encoder agrees with `abi.decode`. Those are the things most likely to
+be wrong, and they are covered by tests, not by tooling.
 
 ## Known-unsafe by design
 
@@ -20,12 +35,14 @@ for oversights. Each is also called out in the README.
 | Component | What is unsafe | Consequence |
 | --- | --- | --- |
 | **TLS** (validator mesh + RPC) | Self-signed certs, verification disabled | Transport is unauthenticated. Consensus still signature-checks every vertex, so blocks can't be forged — but bandwidth can be wasted. |
-| **Client RPC** | No auth, quotas, or rate limits | Trivially DoS-able. Needs stake- or key-weighted admission control before public exposure. |
+| **Client RPC** | Per-connection rate limiting only | Bounds one client; **not Sybil resistance** — many connections get many buckets. Needs stake- or key-weighted admission across connections before public exposure. |
 | **TalonVM** | No state-rollback journal | A trapped transaction's partial writes persist (deterministically on every node). |
 | **Equivocation** | Detected, not slashed | A double-proposing validator is surfaced but not punished. |
 | **Wire format** | `bincode` | Not a canonical encoding; unsuitable for cross-implementation consensus. |
-| **EVM contract** | Unaudited, undeployed, never run against a real Groth16 proof | Do not deploy. |
-| **SP1 backend** | Written but never compiled or executed | `Proof::Native` carries **no** cryptographic argument. |
+| **EVM contract** | Unaudited and undeployed | Compiled, tested (41 passing Foundry tests), Slither-clean. **The end-to-end test against a real Groth16 proof is written but has never been run** (it needs Docker). Do not put value behind it. |
+| **Committee rotation (Peregrine → Ethereum)** | Not implemented | `committeeDigest` is immutable in the EVM client, so a Peregrine validator-set change requires deploying a new contract. **This is the weakest link in that direction.** |
+| **Groth16 trusted setup** | Circuit-specific setup performed by Succinct | Unavoidable if you want EVM-affordable verification. Peregrine's own verification of Ethereum uses Compressed STARK, which has no trusted setup — the asymmetry is a property of the EVM, not of the protocol. |
+| **SP1 backend** | Real proofs generated and verified, but the proving path is **unaudited** and has only been exercised on the header-chain witness | `Proof::Native` still carries **no** cryptographic argument; only `Proof::Zk` does. |
 
 ## The security properties that *are* real
 
@@ -44,11 +61,21 @@ Stated precisely, because "trust-minimized" is easy to claim and hard to earn:
   anchored by a BLS-verified beacon update, and anchors move forward only.
 * **Image pinning.** A valid proof of a *different program* is still a valid
   proof; the verifier pins the program's verifying-key hash before doing any
-  cryptography.
+  cryptography. The EVM client pins three things — program, committee, and
+  chain id — all immutable, because an upgradeable pin is an admin key that can
+  redefine what every past and future proof meant.
+* **Verify before decode.** The EVM client checks the proof *before* reading a
+  single field of the public values. Decoding first and validating later is how
+  verifiers end up acting on attacker-chosen data.
+* **Equivocation stops the client.** Two different store roots proven for the
+  same Peregrine round revert rather than being silently absorbed. Absorbing it
+  would let an attacker who achieved it write state under a root of their
+  choosing.
 
 These are enforced by tests that run on every CI push — see
-`tests/zk_security.rs`, `tests/foreign_claims.rs`, and
-`tests/bls_sync_committee.rs`.
+`tests/zk_security.rs`, `tests/foreign_claims.rs`,
+`tests/bls_sync_committee.rs`, `tests/state_journal.rs`, and the Foundry suite
+under `contracts/test/`.
 
 ## Consensus-critical configuration
 

@@ -80,6 +80,10 @@ enum Command {
     Sdk(SdkCmd),
     /// Submit a Talon transaction that writes a value into a table.
     SubmitTx(SubmitTxArgs),
+    /// Live terminal dashboard for a running node.
+    Watch(WatchArgs),
+    /// Submit a proof-carrying foreign claim (Ethereum state) to a node.
+    SubmitClaim(SubmitClaimArgs),
     /// Read a table key from a running node and verify the proof locally.
     Read(ReadArgs),
 }
@@ -196,12 +200,34 @@ enum SdkCmd {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum ExampleName {
+    /// Tokenized real-world asset: a property loan collateralised on Ethereum.
+    Rwa,
     /// Publish signed stream records, then read one back with a proof.
     PublishStream,
     /// Submit a Talon transaction and read back its result.
     SubmitTx,
     /// Verify a read against the store root, then try to forge it.
     LightClient,
+}
+
+#[derive(Args)]
+struct SubmitClaimArgs {
+    /// Path to a JSON-encoded `VerifiedClaim` (as written by the RWA example).
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    /// Node RPC address (default: the configured node.rpc_addr).
+    #[arg(long, value_name = "ADDR")]
+    rpc_addr: Option<SocketAddr>,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    /// Node RPC address (default: the configured node.rpc_addr).
+    #[arg(long, value_name = "ADDR")]
+    rpc_addr: Option<SocketAddr>,
+    /// Values to watch, as `table:key` (repeatable).
+    #[arg(long = "key", value_name = "TABLE:KEY")]
+    keys: Vec<String>,
 }
 
 #[derive(Args)]
@@ -281,11 +307,24 @@ async fn run_async(cmd: Command, cfg: Config) -> Result<()> {
             .await
         }
         Command::Sdk(SdkCmd::Example { name }) => match name {
+            ExampleName::Rwa => peregrine_node::demos::rwa().await,
             ExampleName::PublishStream => peregrine_node::demos::publish_stream().await,
             ExampleName::SubmitTx => peregrine_node::demos::submit_tx().await,
             ExampleName::LightClient => peregrine_node::demos::light_client().await,
         },
         Command::SubmitTx(args) => run_submit_tx(args, cfg).await,
+        Command::Watch(args) => {
+            let addr = args.rpc_addr.unwrap_or(cfg.node.rpc_addr);
+            let mut watched = Vec::new();
+            for spec in &args.keys {
+                let (t, k) = spec
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("--key expects TABLE:KEY, got {spec:?}"))?;
+                watched.push((parse_table(t)?, parse_key(k)?, spec.clone()));
+            }
+            peregrine_node::demos::watch(addr, &watched).await
+        }
+        Command::SubmitClaim(args) => run_submit_claim(args, cfg).await,
         Command::Read(args) => run_read(args, cfg).await,
         // Handled synchronously in `main`.
         Command::Config(_) | Command::Keygen(_) => unreachable!(),
@@ -359,6 +398,49 @@ async fn run_submit_tx(args: SubmitTxArgs, cfg: Config) -> Result<()> {
 
     println!("submitted: {} [{}] = {}", args.table, args.key, args.value);
     println!("(commit is asynchronous — read it back with `peregrine read`)");
+    Ok(())
+}
+
+/// Hand a proof-carrying claim to a node.
+///
+/// The node will *accept* it into the ingest queue on nothing more than a size
+/// and rate check — the cryptography is checked later, by every validator, at
+/// commit time. So a success here means "queued", not "believed"; the claim is
+/// only real once it shows up in `sys.eth_state`, which `peregrine read` can
+/// confirm. That split is deliberate: an RPC front door must never be the thing
+/// deciding what consensus accepts.
+async fn run_submit_claim(args: SubmitClaimArgs, cfg: Config) -> Result<()> {
+    let bytes = std::fs::read(&args.file)
+        .with_context(|| format!("read claim from {}", args.file.display()))?;
+    if bytes.len() > peregrine_sdk::protocol::MAX_CLAIM_BYTES {
+        anyhow::bail!(
+            "claim is {} bytes, over the {} byte limit the node will accept",
+            bytes.len(),
+            peregrine_sdk::protocol::MAX_CLAIM_BYTES
+        );
+    }
+    let claim: peregrine_sdk::VerifiedClaim =
+        serde_json::from_slice(&bytes).context("parse claim JSON")?;
+
+    let j = &claim.journal;
+    println!("claim  : chain {} block {}", j.chain_id, j.block_number);
+    println!(
+        "proof  : {}",
+        if claim.proof.is_zk() {
+            "ZK"
+        } else {
+            "native (will be REFUSED by a strict node)"
+        }
+    );
+
+    let addr = args.rpc_addr.unwrap_or(cfg.node.rpc_addr);
+    let client = connect(addr).await?;
+    client.submit_claim(claim).await.context("submit claim")?;
+
+    println!("queued for verification at {addr}");
+    println!(
+        "(consensus verifies it — read it back with `peregrine read` to confirm it was accepted)"
+    );
     Ok(())
 }
 

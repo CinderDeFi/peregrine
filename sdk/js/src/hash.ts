@@ -19,8 +19,20 @@ const D_MERKLE_LEAF = enc.encode("peregrine.merkle.leaf.v1");
 const D_SMT_LEAF = enc.encode("peregrine.smt.leaf.v1");
 const D_SMT_EMPTY = enc.encode("peregrine.smt.empty.v1");
 
-/** Depth of the sparse Merkle tree = bits in a position hash. */
+/** v2 (path-compressed) tags. Disjoint from v1's, so a v1 hash can never be
+ *  read as a v2 one — which matters precisely because both coexist during a
+ *  migration. */
+const D_SMT2_LEAF = enc.encode("peregrine.smt.v2.leaf");
+const D_SMT2_EMPTY = enc.encode("peregrine.smt.v2.empty");
+const D_SMT2_NODE = enc.encode("peregrine.smt.v2.node");
+
+/** Depth of the **v1** sparse Merkle tree = bits in a position hash.
+ *  v2 has no fixed depth: a path stops at the first bit that separates two
+ *  keys, so proofs are ~log2(n) deep instead of 256. */
 export const SMT_DEPTH = 256;
+
+/** Upper bound on a v2 path — reaching it would mean a blake3 collision. */
+export const SMT_V2_MAX_DEPTH = 256;
 
 /** BLAKE3 over the concatenation of `parts` (`Hash::digest` when given one part). */
 export function digest(...parts: Bytes[]): Bytes {
@@ -47,6 +59,28 @@ export function smtLeafHash(key: Bytes, value: Bytes): Bytes {
 /** The empty-slot leaf constant (`smt::empty_leaf`). */
 export function smtEmptyLeaf(): Bytes {
   return digest(D_SMT_EMPTY);
+}
+
+// ── v2 (path-compressed) primitives ─────────────────────────────────────────
+
+/** v2 occupied leaf (`smt_v2::leaf_hash`).
+ *
+ *  Deliberately **depth-independent**: the leaf binds its own key, and
+ *  `blake3(key)` fixes where that key lives, so a verifier that recomputes the
+ *  position itself can tell whether a leaf is where it claims. */
+export function smtV2LeafHash(key: Bytes, value: Bytes): Bytes {
+  return digest(D_SMT2_LEAF, u32le(key.length), key, u32le(value.length), value);
+}
+
+/** v2 empty subtree (`smt_v2::empty_hash`). One constant, not a per-height
+ *  table — v2 never folds through empty levels. */
+export function smtV2Empty(): Bytes {
+  return digest(D_SMT2_EMPTY);
+}
+
+/** v2 interior node (`smt_v2::node_hash`). */
+export function smtV2Node(left: Bytes, right: Bytes): Bytes {
+  return digest(D_SMT2_NODE, left, right);
 }
 
 /** The i-th bit of a 32-byte position, MSB of byte 0 first. */

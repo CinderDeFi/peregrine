@@ -31,12 +31,20 @@ impl Hash {
     }
 
     /// Domain-separated combination of two child hashes (Merkle interior node).
+    /// Domain-separated combination of two child hashes (Merkle interior node).
+    ///
+    /// The preimage is a fixed 88 bytes, so it is assembled on the stack and
+    /// hashed in one shot rather than through a streaming `Hasher`. Identical
+    /// bytes in, identical hash out — this is a pure allocation/setup saving,
+    /// not a change to the commitment. It matters because a 256-deep sparse
+    /// Merkle update calls this once per level, 256 times per row.
     pub fn combine(left: &Hash, right: &Hash) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"peregrine.merkle.node.v1");
-        hasher.update(&left.0);
-        hasher.update(&right.0);
-        Hash(*hasher.finalize().as_bytes())
+        const DOMAIN: &[u8; 24] = b"peregrine.merkle.node.v1";
+        let mut buf = [0u8; 24 + 32 + 32];
+        buf[..24].copy_from_slice(DOMAIN);
+        buf[24..56].copy_from_slice(&left.0);
+        buf[56..].copy_from_slice(&right.0);
+        Hash(*blake3::hash(&buf).as_bytes())
     }
 
     pub fn short(&self) -> String {

@@ -29,6 +29,8 @@ pub mod payload;
 pub mod pipeline;
 pub mod quic;
 pub mod rpc;
+pub mod rpc_limits;
 pub mod sim;
 pub mod store;
+pub mod tiles;
 pub mod validator;

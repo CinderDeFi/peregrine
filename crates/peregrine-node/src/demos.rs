@@ -164,9 +164,7 @@ pub async fn light_client() -> Result<()> {
 
     // 3. Tamper with the proof path itself.
     let mut bent = read.clone();
-    if let Some(first) = bent.row_proof.siblings.first_mut() {
-        *first = Hash::ZERO;
-    }
+    bent.row_proof.corrupt_first_sibling();
     println!("  corrupted proof path     … {}", ok(!bent.verify(&root)));
 
     println!("\nA light client needs the 32-byte root and nothing else.");
@@ -397,4 +395,296 @@ fn eth_interop_act() -> Result<()> {
     println!("  anchored by a BLS-verified beacon update. Both are implemented; see");
     println!("  `cargo test -p peregrine-interop --features bls`.");
     Ok(())
+}
+
+// ── RWA: a property-backed loan, priced by an oracle, collateralised on Ethereum ──
+
+/// Tokenized real-world asset demo (`peregrine sdk example rwa`).
+///
+/// A property-backed loan whose health depends on three things Peregrine can
+/// prove and a bridge cannot:
+///
+/// 1. a **valuation** delivered by an oracle over Slipstream (signed, sequenced
+///    by consensus, materialized into a table);
+/// 2. **collateral** posted as USDC on *Ethereum*, read through a verified
+///    state proof rather than a relayer's assertion;
+/// 3. a **TalonVM contract** that computes loan health from both — and
+///    **refuses to run at all** if the Ethereum side hasn't been verified.
+///
+/// That last property is what makes this an RWA system rather than an oracle
+/// with extra steps: an under-collateralised loan cannot be marked healthy by
+/// withholding data, because missing data traps instead of reading as zero.
+pub async fn rwa() -> Result<()> {
+    use crate::payload::WirePayload;
+    use crate::pipeline::{ClaimPolicy, ExecutionPipeline};
+    use peregrine_interop::beacon::Anchor;
+    use peregrine_interop::zk::{Claim, Journal, NativeProver, NativeVerifier, Prover};
+
+    // USDC on Ethereum mainnet; the escrow's balance is slot-mapped per holder.
+    const USDC: [u8; 20] = [
+        0xa0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1, 0x9d, 0x4a, 0x2e, 0x9e, 0xb0,
+        0xce, 0x36, 0x06, 0xeb, 0x48,
+    ];
+    const CHAIN_ETH: u64 = 1;
+    const PROPERTY: &[u8] = b"PROP-1729-BRIXTON";
+    // USDC has 6 decimals throughout.
+    const REQUIRED_RATIO_PCT: u64 = 30; // loan needs 30% of valuation posted
+
+    let registry = TableId::named("rwa.registry");
+    let health = TableId::named("rwa.health");
+    let escrow_slot = {
+        let mut s = [0u8; 32];
+        s[31] = 9; // the escrow account's balance slot
+        s
+    };
+
+    println!("\n\x1b[1m── RWA · property-backed loan ──────────────────────────\x1b[0m");
+    println!("asset      : {}", String::from_utf8_lossy(PROPERTY));
+    println!("valuation  : from a signed oracle stream");
+    println!("collateral : USDC on Ethereum, via a verified state proof\n");
+
+    // ── 1. oracle publishes a valuation over Slipstream ────────────────────
+    let mut devnet = Devnet::start().await?;
+    let client = Client::connect(devnet.rpc_addr).await?;
+    let valuation_usdc: u64 = 500_000_000_000; // $500,000.000000
+    client
+        .publish(devnet.publisher.emit(valuation_usdc.to_le_bytes().to_vec()))
+        .await?;
+
+    let mut tick_key = Vec::with_capacity(40);
+    tick_key.extend_from_slice(&devnet.publisher.stream_id().0 .0);
+    tick_key.extend_from_slice(&0u64.to_be_bytes());
+    let tick = await_read(&client, ticks_table(), &tick_key).await?;
+    println!(
+        "1. oracle valuation committed   : ${}",
+        usdc(u64::from_le_bytes(tick.value[..8].try_into()?))
+    );
+
+    // Record it in the registry with a Talon tx, so the contract reads chain
+    // state rather than trusting the caller's number.
+    client
+        .submit_tx(vec![
+            Instr::Push(valuation_usdc),
+            Instr::StoreTable {
+                table: registry,
+                key: PROPERTY.to_vec(),
+            },
+            Instr::Halt,
+        ])
+        .await?;
+    await_read(&client, registry, PROPERTY).await?;
+    println!(
+        "2. registered on-chain          : rwa.registry[{}]",
+        String::from_utf8_lossy(PROPERTY)
+    );
+    devnet.shutdown().await?;
+
+    // ── 2. the loan-health contract ────────────────────────────────────────
+    //
+    //   required   = valuation * 30 / 100
+    //   healthy    = collateral > required
+    //
+    // `LoadEthState` traps if the collateral has not been proven, so this
+    // program cannot produce a verdict from unverified data.
+    let loan_health = vec![
+        Instr::LoadTable {
+            table: registry,
+            key: PROPERTY.to_vec(),
+        }, // valuation
+        Instr::Push(REQUIRED_RATIO_PCT),
+        Instr::Mul,
+        Instr::Push(100),
+        Instr::Div, // → required
+        Instr::LoadEthState {
+            chain_id: CHAIN_ETH,
+            address: USDC,
+            slot: escrow_slot,
+        },
+        Instr::Lt, // required < collateral  →  1 if healthy
+        Instr::StoreTable {
+            table: health,
+            key: PROPERTY.to_vec(),
+        },
+        Instr::Halt,
+    ];
+
+    // A node configured for Ethereum interop. (In production the claim carries
+    // an SP1 proof and the block is anchored by a BLS-verified beacon update;
+    // see `cargo test -p peregrine-interop --features bls`.)
+    let block_hash = [0x11u8; 32];
+    let mut node = ExecutionPipeline::new();
+    node.claim_policy = ClaimPolicy::Verified {
+        verifier: Box::new(NativeVerifier),
+        chain_id: CHAIN_ETH,
+    };
+    node.anchors.insert(Anchor {
+        slot: 14_817_376,
+        block_number: 25_580_735,
+        block_hash,
+        state_root: [0x22; 32],
+    })?;
+    node.apply_payload(&WirePayload::TalonTx {
+        program: vec![
+            Instr::Push(valuation_usdc),
+            Instr::StoreTable {
+                table: registry,
+                key: PROPERTY.to_vec(),
+            },
+            Instr::Halt,
+        ],
+    });
+
+    // ── 3. the guardrail, before any Ethereum state is proven ──────────────
+    node.apply_payload(&WirePayload::TalonTx {
+        program: loan_health.clone(),
+    });
+    println!(
+        "\n3. verdict with UNVERIFIED collateral … {}",
+        ok(node.prove_read(health, PROPERTY).is_none())
+    );
+    println!("   (the tx trapped — an unproven balance is not a balance)");
+
+    // ── 4. prove the collateral, then re-run ───────────────────────────────
+    let post = |node: &mut ExecutionPipeline, amount: u64| -> Result<()> {
+        let mut word = [0u8; 32];
+        word[24..].copy_from_slice(&amount.to_be_bytes());
+        let claim = NativeProver.prove(Journal {
+            chain_id: CHAIN_ETH,
+            block_number: 25_580_735,
+            block_hash,
+            state_root: [0x22; 32],
+            claim: Claim::Storage {
+                address: USDC,
+                slot: escrow_slot,
+                value: word,
+            },
+        })?;
+        node.apply_foreign_claim(&claim)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    };
+
+    let required = valuation_usdc * REQUIRED_RATIO_PCT / 100;
+    println!("\n   required collateral (30%)    : ${}", usdc(required));
+
+    for (amount, label) in [
+        (200_000_000_000u64, "well collateralised"),
+        (100_000_000_000, "short"),
+    ] {
+        post(&mut node, amount)?;
+        node.apply_payload(&WirePayload::TalonTx {
+            program: loan_health.clone(),
+        });
+        let verdict = node
+            .prove_read(health, PROPERTY)
+            .ok_or_else(|| anyhow::anyhow!("contract should have produced a verdict"))?;
+        let healthy = u64::from_le_bytes(verdict.value[..8].try_into()?) == 1;
+        println!(
+            "   collateral ${:<14} ({:<19}) → {}",
+            usdc(amount),
+            label,
+            if healthy {
+                "\x1b[32mHEALTHY\x1b[0m"
+            } else {
+                "\x1b[31mUNDER-COLLATERALISED\x1b[0m"
+            }
+        );
+    }
+
+    // ── 5. the verdict is provable to anyone holding 32 bytes ──────────────
+    let root = node.store_root();
+    let verdict = node.prove_read(health, PROPERTY).expect("verdict present");
+    println!("\n4. store root                   : {root}");
+    println!(
+        "   verdict proof verifies       … {}",
+        ok(verdict.verify(&root))
+    );
+    println!("\n   A lender audits this with the root alone — no node to trust,");
+    println!("   and no way to hide the Ethereum leg of the collateral.\n");
+    Ok(())
+}
+
+/// Format a 6-decimal USDC amount.
+fn usdc(v: u64) -> String {
+    format!("{}.{:06}", v / 1_000_000, v % 1_000_000)
+}
+
+// ── live view ───────────────────────────────────────────────────────────────
+
+/// Poll a running node and render a live terminal dashboard (`peregrine watch`).
+///
+/// Deliberately a *client*: it uses nothing but the public SDK, so what it can
+/// show is exactly what any application can observe — the store root, and
+/// whatever values you point it at. If a field renders here, it is reachable
+/// over the network by anyone.
+pub async fn watch(
+    rpc_addr: std::net::SocketAddr,
+    keys: &[(TableId, Vec<u8>, String)],
+) -> Result<()> {
+    let client = Client::connect(rpc_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect to {rpc_addr}: {e} (is a node running?)"))?;
+
+    println!("watching {rpc_addr} — Ctrl-C to stop\n");
+    let mut last_root = Hash::ZERO;
+    let mut ticks: u64 = 0;
+
+    loop {
+        let root = client.store_root().await?;
+        let changed = root != last_root;
+        if changed {
+            last_root = root;
+        }
+        ticks += 1;
+
+        // Redraw in place: clear screen, home cursor.
+        print!("\x1b[2J\x1b[H");
+        println!("\x1b[1mPEREGRINE · live\x1b[0m   {rpc_addr}   poll #{ticks}");
+        println!("{}", "─".repeat(60));
+        println!(
+            "store root   {}{}\x1b[0m",
+            if changed { "\x1b[32m" } else { "" },
+            root
+        );
+        println!(
+            "             {}",
+            if changed {
+                "changed since last poll"
+            } else {
+                "unchanged"
+            }
+        );
+        println!("{}", "─".repeat(60));
+
+        if keys.is_empty() {
+            println!("(no keys being watched — pass some to see values)");
+        }
+        for (table, key, label) in keys {
+            match client.prove_read(*table, key).await? {
+                Some(read) => {
+                    let verified = read.verify(&root);
+                    let shown = if read.value.len() >= 8 {
+                        u64::from_le_bytes(read.value[..8].try_into()?).to_string()
+                    } else {
+                        format!("0x{}", hex_of(&read.value))
+                    };
+                    println!(
+                        "{label:<24} {shown:<20} {}",
+                        if verified {
+                            "\x1b[32m✓ proven\x1b[0m"
+                        } else {
+                            "\x1b[31m✗ BAD PROOF\x1b[0m"
+                        }
+                    );
+                }
+                None => println!("{label:<24} {:<20} \x1b[90m(absent)\x1b[0m", "—"),
+            }
+        }
+        println!("\n\x1b[90mevery value above was verified against the root, locally\x1b[0m");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
