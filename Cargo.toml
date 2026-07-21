@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/peregrine-core",
+    "crates/peregrine-consensus",
+    "crates/peregrine-data",
+    "crates/peregrine-vm",
+    "crates/peregrine-node",
+    "crates/peregrine-sdk",
+    "crates/peregrine-cli",
+    "crates/peregrine-interop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Peregrine Labs"]
+repository = "https://github.com/peregrine-labs/peregrine"
+
+[workspace.dependencies]
+# --- async runtime ---
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+# --- serialization ---
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+# --- crypto ---
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+# --- errors & logging ---
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --- CLI & configuration ---
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.8"
+# --- misc ---
+hex = "0.4"
+parking_lot = "0.12"
+# --- QUIC transport (node mesh + client-facing RPC + SDK client) ---
+quinn = "0.11"
+rustls = "0.23"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+
+# internal crates
+peregrine-core = { path = "crates/peregrine-core" }
+peregrine-consensus = { path = "crates/peregrine-consensus" }
+peregrine-data = { path = "crates/peregrine-data" }
+peregrine-vm = { path = "crates/peregrine-vm" }
+peregrine-sdk = { path = "crates/peregrine-sdk" }
+peregrine-node = { path = "crates/peregrine-node" }
+peregrine-interop = { path = "crates/peregrine-interop" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

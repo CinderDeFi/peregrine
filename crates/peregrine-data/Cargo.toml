@@ -1,0 +1,18 @@
+[package]
+name = "peregrine-data"
+description = "Slipstream data plane: streams, tables, Merkle-verifiable reads, and the dual-meter fee model."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peregrine-core.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

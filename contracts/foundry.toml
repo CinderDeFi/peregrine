@@ -1,0 +1,18 @@
+# Foundry project for Peregrine's EVM-side light client.
+#
+# No external libraries: the tests deliberately avoid forge-std so the project
+# builds from a clean checkout with no git submodules or package manager. That
+# costs some assertion sugar and buys reproducibility.
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = []
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 200
+
+[fmt]
+line_length = 100
+tab_width = 4

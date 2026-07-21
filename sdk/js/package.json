@@ -1,0 +1,20 @@
+{
+  "name": "@peregrine/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client and light-client proof verifier for Peregrine.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "example": "node examples/verify-proof.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.7.1"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}

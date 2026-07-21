@@ -1,0 +1,40 @@
+[package]
+name = "peregrine-interop"
+description = "Trust-minimized cross-chain verification: Ethereum header + Merkle-Patricia state proof checking, the reciprocal Peregrine light client, and an SP1 proving backend."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Real SP1 proving/verification. Off by default because `sp1-sdk` is a very
+# large dependency and its guest toolchain is Linux/macOS-only — the pure
+# verification core must stay buildable everywhere, including inside a zkVM.
+sp1 = ["dep:sp1-sdk"]
+# BLS12-381 sync-committee verification. Off by default because `blst`
+# compiles C/assembly and therefore cannot build inside a zkVM guest; the pure
+# verification core must stay guest-compatible.
+bls = ["dep:blst"]
+
+[dependencies]
+peregrine-core.workspace = true
+peregrine-data.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+# Ethereum primitives. Both are small and `no_std`-capable, which is what lets
+# this crate compile unchanged as an SP1 / RISC Zero guest program.
+rlp = "0.5"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+# SHA-256 for consensus-layer SSZ merkleization (the beacon chain uses SHA-256,
+# not keccak). SP1 ships an accelerated patch for this crate.
+sha2 = "0.10"
+# Host-side proving. Optional: see the `sp1` feature above.
+sp1-sdk = { version = "6.3", optional = true }
+# Ethereum's reference BLS library (min_pk: G1 keys, G2 signatures).
+blst = { version = "0.3", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+hex.workspace = true
+rand.workspace = true

@@ -1,0 +1,28 @@
+//! # peregrine-data — the Slipstream data plane (bootstrap)
+//!
+//! Implements the wedge we are proving first (design doc §4.5):
+//!
+//! * [`streams`] — protocol-level pub/sub: publishers sign fixed-schema
+//!   records; records ride *inside consensus dissemination* as vertex
+//!   payload items; committed records fan out to subscribers.
+//! * [`merkle`] — a simple binary Merkle tree with inclusion proofs.
+//!   Verkle/multiproof commitments replace this later behind the same
+//!   `root()/prove()/verify()` shape.
+//! * [`tables`] — first-class key/value tables with a per-table root, a
+//!   store-wide state root, and **verifiable reads** (value + two-level
+//!   proof against the state root) — the seed of StateSQL.
+//! * [`fees`] — the dual-meter economy: compute gas and data bytes metered
+//!   and priced independently, with the 50/30/20 burn/validator/endowment
+//!   split from §5.2.
+
+pub mod fees;
+pub mod merkle;
+pub mod smt;
+pub mod streams;
+pub mod tables;
+
+pub use fees::{DualMeter, FeeQuote, FeeSchedule, FeeSplit};
+pub use merkle::{MerkleProof, MerkleTree};
+pub use smt::{SmtProof, SparseMerkleTree};
+pub use streams::{StreamId, StreamRecord, StreamRegistry, StreamShred, SubscriberHandle};
+pub use tables::{ProvenAbsence, ProvenRead, RangeProof, TableId, TableStore};

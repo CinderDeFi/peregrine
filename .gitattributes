@@ -1,0 +1,21 @@
+# Normalise line endings. Without this, a Windows checkout commits CRLF and
+# Linux CI sees spurious diffs (and shell scripts break). LF in the repo, LF on
+# checkout, everywhere.
+* text=auto eol=lf
+
+# Rust / Solidity / TS sources are always text.
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.sol     text eol=lf
+*.ts      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+Makefile  text eol=lf
+
+# Test fixtures are generated JSON — large, and never worth reviewing by eye.
+crates/peregrine-interop/tests/fixtures/*.json linguist-generated=true
+sdk/js/test/fixtures/*.json                    linguist-generated=true
+
+# Don't let vendored/generated content skew the language stats.
+docs/**        linguist-documentation=true

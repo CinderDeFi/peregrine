@@ -1,0 +1,26 @@
+[package]
+name = "peregrine-cli"
+description = "The `peregrine` command-line interface: run nodes, simulate, benchmark, generate keys, and query state."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The single user-facing entry point for the whole workspace.
+[[bin]]
+name = "peregrine"
+path = "src/main.rs"
+
+[dependencies]
+peregrine-core.workspace = true
+peregrine-data.workspace = true
+peregrine-node.workspace = true
+peregrine-sdk.workspace = true
+clap.workspace = true
+toml.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+hex.workspace = true

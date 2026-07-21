@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on warnings in CI while keeping local builds quiet.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The demo and the harness are load-bearing documentation: if they stop
+      # working, the README is lying. Keep them cheap so CI stays fast.
+      - name: Smoke-test the sim
+        run: cargo run --release -p peregrine-cli -- sim --ticks 400
+
+      - name: Smoke-test the CLI
+        run: |
+          cargo run -p peregrine-cli -- --version
+          cargo run -p peregrine-cli -- config show
+          cargo run -p peregrine-cli -- keygen
+
+      # The README leads with `peregrine demo`; if it breaks, the front door is
+      # broken.
+      - name: Smoke-test the demo
+        run: cargo run --release -p peregrine-cli -- -q demo
+
+  js:
+    name: js sdk (light client)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/js
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No lockfile is committed (single dependency), so `install`, not `ci`.
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      # Verifies the TypeScript light client against real Rust-generated
+      # proofs committed in test/fixtures.
+      - name: Test
+        run: npm test
+
+  cross-language-proofs:
+    name: rust ↔ js proof agreement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Regenerate the fixture from the Rust implementation, then verify it
+      # with the TypeScript one. This is what stops the two verifiers from
+      # silently drifting apart — a light client that disagrees with the chain
+      # is worse than no light client.
+      - name: Regenerate proof fixture from Rust
+        run: cargo run -p peregrine-node --example gen_js_fixture
+
+      - name: Verify it in TypeScript
+        working-directory: sdk/js
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+  contracts:
+    name: evm verifier (foundry)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Build
+        run: forge build
+      - name: Test
+        run: forge test -vv
+
+  interop-bls:
+    name: rust interop (bls feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # BLS is feature-gated (blst compiles C), so the default job does not
+      # cover it. These are the tests that verify real mainnet signatures and
+      # sync-committee rotation.
+      - name: Test with BLS
+        run: cargo test -p peregrine-interop --features bls

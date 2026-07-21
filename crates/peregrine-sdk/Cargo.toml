@@ -1,0 +1,27 @@
+[package]
+name = "peregrine-sdk"
+description = "Rust client SDK for Peregrine: connect over QUIC, publish streams, submit Talon txs, run proven reads, and verify light-client proofs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Type surface the SDK re-exports and speaks (keys, hashes, streams, tables,
+# proofs, VM instructions). No dependency on peregrine-node: the SDK is a
+# client, and the node depends on *it* for the shared wire protocol.
+peregrine-core.workspace = true
+peregrine-data.workspace = true
+peregrine-vm.workspace = true
+peregrine-interop.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+# QUIC client transport + dev TLS (skip-verify; production pins validator id).
+quinn.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+rand.workspace = true

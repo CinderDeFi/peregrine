@@ -1,0 +1,47 @@
+# ── Rust ──
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# ── Node / TypeScript SDK ──
+node_modules/
+package-lock.json
+*.tsbuildinfo
+
+# ── Solidity / Foundry ──
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+# `forge script --broadcast` writes deployment logs; keep the dry-run noise out
+# but note that real deployment records are worth committing deliberately.
+
+# ── Local runtime state ──
+# Default storage dir from `peregrine config init`; holds the per-validator
+# redb files written by `peregrine node run`.
+/peregrine-data/
+*.redb
+
+# Local configuration is per-developer. Scaffold your own with
+# `peregrine config init`; commit one deliberately if your deployment needs it.
+/peregrine.toml
+
+# ── Secrets ──
+# `peregrine keygen --out` writes a raw ed25519 seed. Never commit one.
+*.key
+/keys/
+
+# ── Editor / tooling ──
+.claude/
+.vscode/
+.idea/
+
+# ── Stale duplicate (safe to delete) ──
+# `peregrine/` is an abandoned Week-1 copy of the scaffold: it has its own
+# Cargo.toml, is NOT a workspace member, and contains none of the current
+# crates. Excluded so it never reaches the public repo; deleting it from disk
+# is recommended.
+/peregrine/
+
+# ── OS ──
+.DS_Store
+Thumbs.db

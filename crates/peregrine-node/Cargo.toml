@@ -1,0 +1,36 @@
+[package]
+name = "peregrine-node"
+description = "Validator node: local multi-node simulation wiring consensus, streams, tables, fees, and the VM together."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peregrine-core.workspace = true
+peregrine-consensus.workspace = true
+peregrine-data.workspace = true
+peregrine-vm.workspace = true
+peregrine-sdk.workspace = true
+peregrine-interop.workspace = true
+tokio.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+hex.workspace = true
+# Embedded, single-file, ACID key-value store for node persistence. Confined
+# to peregrine-node so the pure-logic crates (core/consensus/data/vm) stay
+# dependency-free and portable to the future tile runtime.
+redb = "2"
+# Real QUIC transport (validator mesh + client-facing RPC). Dev TLS only
+# (self-signed + skip-verify); production binds validator identity into the cert.
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+
+[dev-dependencies]
+# For generating the JS SDK's cross-language proof fixture (clean hex JSON).
+serde_json = "1"

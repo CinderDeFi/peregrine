@@ -1,0 +1,15 @@
+[package]
+name = "peregrine-core"
+description = "Core types, crypto primitives, and identifiers shared across all Peregrine crates."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+hex.workspace = true

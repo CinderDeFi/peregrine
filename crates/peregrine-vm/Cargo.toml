@@ -1,0 +1,12 @@
+[package]
+name = "peregrine-vm"
+description = "TalonVM stub: metered mini-ISA interpreter with data-native host calls and an EVM-compat call surface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peregrine-core.workspace = true
+peregrine-data.workspace = true
+serde.workspace = true
+thiserror.workspace = true
