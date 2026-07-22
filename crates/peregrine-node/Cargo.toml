@@ -42,7 +42,9 @@ core_affinity.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
-
-[dev-dependencies]
-# For generating the JS SDK's cross-language proof fixture (clean hex JSON).
+# JSON/HTTP gateway (`peregrine gateway`): fronts the node's QUIC RPC so a
+# browser explorer can reach it. Dev transport only — CORS-permissive, no TLS.
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+# Gateway JSON encoding, and the JS SDK's cross-language proof fixture.
 serde_json = "1"

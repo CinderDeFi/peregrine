@@ -291,6 +291,28 @@ value it shows is re-verified against the root in your own process before it is
 printed. If a node lies, the line turns red — the dashboard cannot be used to
 launder an unproven value into a pretty display.
 
+### Block explorer (in the browser)
+
+The same idea as `watch`, in a web page. [`explorer/`](explorer) is a static
+block explorer where **every value is re-verified in your browser** against the
+store root, via the real `@peregrine/sdk`. It shows the committed root, a
+timeline of the commits it has observed, and watched tables / stream ticks /
+claims — each marked ✓ verified or ✗ forged by your own machine, not the node's.
+
+```bash
+# offline demo (real proofs, no node needed — also how it runs on GitHub Pages)
+cd explorer && python3 -m http.server 8000      # then open http://localhost:8000
+
+# against a live node: a browser can't speak QUIC, so run the HTTP↔QUIC gateway
+peregrine node run                              # a devnet with an RPC endpoint
+peregrine gateway                               # read-only bridge on :8080, CORS-on
+# open http://localhost:8000/?gateway=http://127.0.0.1:8080/rpc
+```
+
+The gateway is read-only and adds nothing to the trust model: a hostile gateway
+can withhold data, but a tampered proof fails the browser's check. See
+[`explorer/README.md`](explorer/README.md).
+
 ### Write and read some state
 
 ```bash
@@ -374,6 +396,7 @@ peregrine/
 │   │   ├── src/network.rs        #   Broadcaster/Inbox surface (+ in-process backend)
 │   │   ├── src/quic.rs           #   real QUIC transport: framed streams, reconnect
 │   │   ├── src/rpc.rs            #   client-facing QUIC RPC server (serves the SDK)
+│   │   ├── src/gateway.rs        #   HTTP↔QUIC JSON gateway (peregrine gateway) for the web explorer
 │   │   ├── src/devnet.rs         #   one-call local node + RPC, for examples/tests
 │   │   ├── src/payload.rs        #   WirePayload: Shred | TalonTx
 │   │   ├── src/pipeline.rs       #   committed order → streams → tables → fees
@@ -390,6 +413,10 @@ peregrine/
 │   ├── src/verify.ts             #   light-client proof verification, version-dispatched
 │   ├── src/client.ts             #   typed client, pluggable transport
 │   └── test/                     #   verifies real Rust-generated proofs
+├── explorer/                     # static block explorer — verifies every value in-browser
+│   ├── index.html · app.js       #   UI + polling/search/tamper demo
+│   ├── demo-transport.js         #   offline mode backed by real proofs (GitHub Pages)
+│   └── vendor/peregrine-sdk.js   #   the SDK, bundled for the browser
 ├── contracts/                    # EVM light client (Foundry) + AUDIT.md
 └── website/                      # the public site: one self-contained HTML file
 ```

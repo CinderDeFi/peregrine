@@ -11,6 +11,7 @@
 //! peregrine config init|show    # scaffold / inspect configuration
 //! peregrine sdk example <name>  # runnable SDK walkthroughs
 //! peregrine read <table> <key>  # proven read, verified locally
+//! peregrine gateway             # HTTP/JSON gateway for the web explorer
 //! ```
 //!
 //! Configuration layers defaults → `peregrine.toml` → flags; see [`config`].
@@ -86,6 +87,19 @@ enum Command {
     SubmitClaim(SubmitClaimArgs),
     /// Read a table key from a running node and verify the proof locally.
     Read(ReadArgs),
+    /// Serve an HTTP/JSON gateway that fronts a node's QUIC RPC (for the web
+    /// explorer and other browser clients). Read-only; CORS-permissive.
+    Gateway(GatewayArgs),
+}
+
+#[derive(Args)]
+struct GatewayArgs {
+    /// HTTP address for the gateway to listen on (browsers connect here).
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
+    bind: SocketAddr,
+    /// The node's QUIC RPC address to front (default: the configured node.rpc_addr).
+    #[arg(long, value_name = "ADDR")]
+    node: Option<SocketAddr>,
 }
 
 #[derive(Args)]
@@ -333,6 +347,10 @@ async fn run_async(cmd: Command, cfg: Config) -> Result<()> {
         }
         Command::SubmitClaim(args) => run_submit_claim(args, cfg).await,
         Command::Read(args) => run_read(args, cfg).await,
+        Command::Gateway(args) => {
+            let node = args.node.unwrap_or(cfg.node.rpc_addr);
+            peregrine_node::gateway::serve(args.bind, node).await
+        }
         // Handled synchronously in `main`.
         Command::Config(_) | Command::Keygen(_) => unreachable!(),
     }

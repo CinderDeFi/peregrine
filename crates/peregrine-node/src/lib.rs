@@ -24,6 +24,7 @@
 pub mod bench;
 pub mod demos;
 pub mod devnet;
+pub mod gateway;
 pub mod network;
 pub mod payload;
 pub mod pipeline;
