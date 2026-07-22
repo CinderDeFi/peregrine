@@ -18,12 +18,17 @@ use crate::tiles::TilePool;
 use peregrine_consensus::{CommitObserver, Dag};
 use peregrine_core::{Hash, Round};
 use peregrine_data::fees::{DualMeter, FeeSchedule, FeeSplit};
+use peregrine_data::sessions::{
+    self as sessions, balances_table, sessions_table, Action, Grains, SessionState, SignedAction,
+    SignedGrant,
+};
 use peregrine_data::streams::{StreamId, StreamRegistry, SubscriberHandle};
 use peregrine_data::tables::{ProvenRead, TableId, TableStore, TreeVersion};
 use peregrine_interop::beacon::AnchorStore;
 use peregrine_interop::zk::Claim;
 use peregrine_interop::{VerifiedClaim, Verifier};
 use peregrine_vm::{Host, ProvenValue, Vm};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Table that materializes committed stream records: key = (stream, seq).
@@ -83,6 +88,15 @@ impl LatencyHistogram {
 /// Rolling metrics for the demo/report.
 #[derive(Debug, Default, Clone)]
 pub struct PipelineMetrics {
+    /// Session actions accepted / refused by policy.
+    pub session_actions_applied: u64,
+    pub session_actions_rejected: u64,
+    pub sessions_revoked: u64,
+    /// Total grains moved by session-authorised payments.
+    pub session_grains_spent: u64,
+    /// Per-record subscription charges on the fast path, and their total.
+    pub micropayments: u64,
+    pub micropayment_grains: u64,
     /// Times the store migrated Merkle versions. Should be exactly 0 or 1 in
     /// a node's lifetime; anything higher means the activation rule is firing
     /// repeatedly and roots are churning.
@@ -249,6 +263,16 @@ pub struct ExecutionPipeline {
     /// belongs in genesis/config and changes only by coordinated upgrade —
     /// exactly like `ClaimPolicy`.
     pub merkle_v2_activation: Option<Round>,
+    /// Live session state, keyed by session id.
+    ///
+    /// A `BTreeMap` rather than a `HashMap`: this is consensus state, and its
+    /// iteration order feeds the materialized `sys.sessions` table. A hash map
+    /// would materialize rows in an order that varies per process, and two
+    /// validators would compute different store roots.
+    pub sessions: BTreeMap<Hash, SessionState>,
+    /// The round currently being committed. Session expiry is measured against
+    /// this, never against wall-clock time — see [`peregrine_data::sessions`].
+    current_round: Round,
     /// Optional sig-verify tiles. `None` → everything verifies inline, which is
     /// the old behaviour and what the determinism tests use.
     ///
@@ -263,6 +287,8 @@ impl ExecutionPipeline {
         let mut tables = TableStore::new();
         tables.create_table(ticks_table());
         tables.create_table(eth_state_table());
+        tables.create_table(sessions_table());
+        tables.create_table(balances_table());
         Self {
             streams: StreamRegistry::new(),
             tables,
@@ -274,8 +300,30 @@ impl ExecutionPipeline {
             anchors: AnchorStore::new(256),
             claims_this_commit: 0,
             merkle_v2_activation: None,
+            sessions: BTreeMap::new(),
+            current_round: 0,
             tiles: None,
         }
+    }
+
+    /// Run a Talon program directly against this pipeline.
+    ///
+    /// Test/template seam: production programs arrive as committed
+    /// `WirePayload::TalonTx`. Exposed so a contract template can be exercised
+    /// without standing up a network for each assertion.
+    pub fn run_program_for_test(&mut self, program: &[peregrine_vm::Instr]) {
+        self.apply_payload(&WirePayload::TalonTx {
+            program: program.to_vec(),
+        });
+    }
+
+    /// Set the round used for session expiry, without driving a full commit.
+    ///
+    /// Test seam. Production sets this in `on_commit`, from the round consensus
+    /// actually committed — which is the whole point of measuring TTL in rounds
+    /// rather than seconds.
+    pub fn set_round_for_test(&mut self, round: Round) {
+        self.current_round = round;
     }
 
     /// Schedule the v2 Merkle upgrade at `round`.
@@ -480,9 +528,183 @@ impl ExecutionPipeline {
         verdicts
     }
 
+    // ── sessions & micropayments ────────────────────────────────────────────
+
+    /// Persist a session to the materialized `sys.sessions` table, so anyone
+    /// can *prove* what a session is permitted to do rather than being told.
+    fn materialize_session(&mut self, id: &Hash) {
+        if let Some(st) = self.sessions.get(id) {
+            let bytes = bincode::serialize(st).expect("session serialize");
+            self.tables.insert(sessions_table(), id.0.to_vec(), bytes);
+        }
+    }
+
+    fn balance_of(&self, who: &peregrine_core::PublicKey) -> Grains {
+        self.tables
+            .get(&balances_table(), &who.0)
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Credit `amount` grains to `who` in `sys.balances`.
+    ///
+    /// AUDIT M-1 — **grains are NOT conserved, by design.** This credits a payee
+    /// with no matching debit of the payer, so `sys.balances` is a *credit-only*
+    /// running total of grains received, not a ledger that conserves supply. A
+    /// session's `budget_grains` caps how much that session can *emit*, but it is
+    /// not backed by funds.
+    ///
+    /// This is deliberate, not an oversight: the scaffold has **no funding
+    /// primitive** — no genesis allocation, faucet, or mint — so every account
+    /// starts at zero. A conservative model (debit the principal, refuse when
+    /// underfunded) would make the *first* payment impossible for everyone and
+    /// break the working agent/RWA demos. Turning `sys.balances` into a real,
+    /// conserved ledger is future economic work that must start with a funding
+    /// source; until then, do not treat these balances as spendable value.
+    fn credit(&mut self, who: &peregrine_core::PublicKey, amount: Grains) {
+        let now = self.balance_of(who).saturating_add(amount);
+        self.tables
+            .insert(balances_table(), who.0.to_vec(), now.to_le_bytes().to_vec());
+    }
+
+    /// Open a session. The grant must be signed by the principal it names.
+    pub fn open_session(&mut self, signed: &SignedGrant) -> Result<Hash, sessions::SessionError> {
+        if !signed.verify() {
+            return Err(sessions::SessionError::BadGrant);
+        }
+        // A grant that is already expired is refused rather than stored: a
+        // session nobody can use is just state everyone has to carry forever.
+        if self.current_round > signed.grant.expires_at_round {
+            return Err(sessions::SessionError::GrantAlreadyExpired {
+                expires_at: signed.grant.expires_at_round,
+                now: self.current_round,
+            });
+        }
+        let id = signed.grant.id();
+        // Idempotent: re-delivering the same grant must not reset spend or
+        // resurrect a revoked session.
+        self.sessions
+            .entry(id)
+            .or_insert_with(|| SessionState::open(signed.grant.clone()));
+        self.materialize_session(&id);
+        Ok(id)
+    }
+
+    /// Revoke a session. Only the principal may do this — a compromised
+    /// session key must not be able to interfere with its own revocation.
+    pub fn revoke_session(&mut self, id: &Hash, signature: &peregrine_core::Signature) -> bool {
+        let Some(st) = self.sessions.get(id) else {
+            return false;
+        };
+        if !sessions::verify_revocation(&st.grant.principal, id, signature) {
+            return false;
+        }
+        if let Some(st) = self.sessions.get_mut(id) {
+            st.revoked = true;
+            // Stop the meter immediately: a revoked session must not keep
+            // paying for streams it subscribed to.
+            st.subscriptions.clear();
+        }
+        self.materialize_session(id);
+        self.metrics.sessions_revoked += 1;
+        true
+    }
+
+    /// Authorise and apply one session action.
+    ///
+    /// Every check happens *before* any state changes, so a refused action
+    /// leaves nothing behind — no partial write, no advanced nonce, no debit.
+    pub fn apply_session_action(
+        &mut self,
+        signed: &SignedAction,
+    ) -> Result<Grains, sessions::SessionError> {
+        let id = signed.action.session_id;
+        let round = self.current_round;
+        let state = self
+            .sessions
+            .get(&id)
+            .ok_or(sessions::SessionError::UnknownSession)?;
+
+        // Pure verdict first.
+        let cost = sessions::authorize(state, signed, round)?;
+
+        // Now commit the effects.
+        let action = signed.action.action.clone();
+        let principal = state.grant.principal;
+        {
+            let st = self.sessions.get_mut(&id).expect("checked above");
+            st.next_nonce = st.next_nonce.saturating_add(1);
+            st.spent = st.spent.saturating_add(cost);
+            match &action {
+                Action::Subscribe {
+                    stream,
+                    price_per_record,
+                } => {
+                    st.subscriptions.retain(|(s, _)| s != stream);
+                    st.subscriptions.push((*stream, *price_per_record));
+                }
+                Action::Unsubscribe { stream } => {
+                    st.subscriptions.retain(|(s, _)| s != stream);
+                }
+                _ => {}
+            }
+        }
+
+        match action {
+            Action::Write { table, key, value } => {
+                self.tables.insert(table, key, value);
+            }
+            Action::Pay { payee, amount } => {
+                self.credit(&payee, amount);
+            }
+            Action::Subscribe { .. } | Action::Unsubscribe { .. } => {}
+        }
+        let _ = principal;
+        self.materialize_session(&id);
+        Ok(cost)
+    }
+
+    /// Charge every session subscribed to `stream`, crediting the publisher.
+    ///
+    /// **This is the micropayment fast path.** It runs once per committed
+    /// record and does no signature work — authorisation happened once, at
+    /// subscribe time. Iteration is over a `BTreeMap`, so the order in which
+    /// subscribers are charged (and therefore the resulting state) is identical
+    /// on every validator.
+    fn charge_subscribers(
+        &mut self,
+        stream: &peregrine_data::streams::StreamId,
+        publisher: &peregrine_core::PublicKey,
+    ) {
+        let round = self.current_round;
+        let mut charged: Vec<(Hash, Grains)> = Vec::new();
+        for (id, st) in self.sessions.iter_mut() {
+            if let Some(paid) = sessions::charge_subscription(st, stream, round) {
+                charged.push((*id, paid));
+            }
+        }
+        let mut total = 0u64;
+        for (id, paid) in &charged {
+            // AUDIT L-2: saturating, matching the discipline used everywhere else
+            // in the fee/session path. Overflow is unreachable in practice, but a
+            // silent wrap on a consensus path is not something to leave to chance.
+            total = total.saturating_add(*paid);
+            self.materialize_session(id);
+        }
+        if total > 0 {
+            self.credit(publisher, total);
+            self.metrics.micropayments += charged.len() as u64;
+            self.metrics.micropayment_grains += total;
+        }
+    }
+
     /// Apply one committed shred given its precomputed signature verdict.
     fn apply_shred(&mut self, shred: &peregrine_data::streams::StreamShred, sig_ok: bool) {
         let mut meter = DualMeter::default();
+        // Captured before the borrow below; the publisher is who subscription
+        // fees are paid to.
+        let publisher = self.streams.publisher_key_for(shred);
         match self.streams.apply_committed_with(shred, sig_ok) {
             Ok(data_bytes) => {
                 meter.tick_data(data_bytes);
@@ -492,6 +714,14 @@ impl ExecutionPipeline {
                 meter.tick_data((key.len() + shred.record.payload.len()) as u64);
                 self.tables
                     .insert(ticks_table(), key, shred.record.payload.clone());
+
+                // Micropayments ride the same committed record: every session
+                // subscribed to this stream pays its per-record price, and the
+                // publisher is credited the total. Runs after the shred is
+                // accepted, so nobody pays for data that was rejected.
+                if let Some(publisher) = publisher {
+                    self.charge_subscribers(&shred.record.stream, &publisher);
+                }
 
                 self.metrics.committed_records += 1;
                 let now = now_ns();
@@ -516,25 +746,27 @@ impl ExecutionPipeline {
         let mut meter = DualMeter::default();
         match payload {
             WirePayload::Shred(shred) => {
-                match self.streams.apply_committed(&shred) {
-                    Ok(data_bytes) => {
-                        meter.tick_data(data_bytes);
-                        // Materialized view: (stream, seq) -> payload.
-                        let mut key = Vec::with_capacity(40);
-                        key.extend_from_slice(&shred.record.stream.0 .0);
-                        key.extend_from_slice(&shred.record.seq.to_be_bytes());
-                        meter.tick_data((key.len() + shred.record.payload.len()) as u64);
-                        self.tables
-                            .insert(ticks_table(), key, shred.record.payload.clone());
-
-                        self.metrics.committed_records += 1;
-                        let now = now_ns();
-                        let latency = now.saturating_sub(shred.record.timestamp_ns);
-                        self.metrics.record_latency_ns_sum += latency as u128;
-                        self.metrics.latency.record(latency);
-                    }
-                    Err(e) => tracing::warn!("rejected shred: {e}"),
-                }
+                // Delegate to the one shred implementation rather than
+                // duplicating it. An earlier revision had two copies of this
+                // logic — the batch path and this one — and micropayments were
+                // silently charged on only one of them. One path, one set of
+                // effects. Verification is inline here because this entry point
+                // has no tile pool behind it.
+                let ok = self
+                    .streams
+                    .publisher_key_for(&shred)
+                    .map(|pk| {
+                        peregrine_core::crypto::verify(
+                            &pk,
+                            peregrine_data::streams::STREAM_DOMAIN,
+                            &StreamRegistry::signing_bytes_of(&shred),
+                            &shred.signature,
+                        )
+                        .is_ok()
+                    })
+                    .unwrap_or(false);
+                self.apply_shred(&shred, ok);
+                return; // `apply_shred` settles its own meter
             }
             WirePayload::ForeignClaim(claim) => {
                 // Verification runs on every validator, so acceptance is part
@@ -551,6 +783,37 @@ impl ExecutionPipeline {
                     Err(e) => {
                         self.metrics.foreign_claims_rejected += 1;
                         tracing::warn!("foreign claim rejected: {e}");
+                    }
+                }
+            }
+            WirePayload::OpenSession(signed) => {
+                meter.tick_data(bincode::serialized_size(&signed).unwrap_or(0));
+                match self.open_session(&signed) {
+                    Ok(id) => tracing::debug!(session = %id, "session opened"),
+                    Err(e) => tracing::warn!("session grant rejected: {e}"),
+                }
+            }
+            WirePayload::RevokeSession {
+                session_id,
+                signature,
+            } => {
+                if self.revoke_session(&session_id, &signature) {
+                    tracing::debug!(session = %session_id, "session revoked");
+                } else {
+                    tracing::warn!("revocation rejected for {session_id}");
+                }
+                meter.tick_compute(1_000);
+            }
+            WirePayload::SessionAction(signed) => {
+                meter.tick_data(bincode::serialized_size(&signed).unwrap_or(0));
+                match self.apply_session_action(&signed) {
+                    Ok(spent) => {
+                        self.metrics.session_actions_applied += 1;
+                        self.metrics.session_grains_spent += spent;
+                    }
+                    Err(e) => {
+                        self.metrics.session_actions_rejected += 1;
+                        tracing::warn!("session action rejected: {e}");
                     }
                 }
             }
@@ -586,6 +849,9 @@ impl CommitObserver for ExecutionPipeline {
         // resets at the same point in the committed order, so the bound is
         // deterministic.
         self.claims_this_commit = 0;
+        // Every session rule below is evaluated against this round, so all
+        // validators agree on exactly when a session expires.
+        self.current_round = round;
 
         // ── phase 1: decode (serial, cheap) ─────────────────────────────────
         // Decoding is ~0.2 µs/item and allocates; doing it once here means the

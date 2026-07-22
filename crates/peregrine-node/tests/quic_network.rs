@@ -107,6 +107,34 @@ fn probe(seq: u64) -> NetMessage {
     }
 }
 
+/// Rebind a validator's QUIC endpoint to the same address, retrying while the
+/// OS still holds the port.
+///
+/// Returns as soon as the bind succeeds. On timeout it reports the last OS
+/// error, so "the port never freed" is distinguishable from "the rebind logic
+/// is broken" without a rerun.
+async fn rebind_with_retry(
+    id: ValidatorId,
+    addr: std::net::SocketAddr,
+    addrs: &[std::net::SocketAddr],
+) -> QuicNode {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut last: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        match rebind_node(id, addr, addrs.to_vec()).await {
+            Ok(node) => return node,
+            Err(e) => {
+                last = Some(e.to_string());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!(
+        "could not rebind {id:?} to {addr} within 30s; last error: {}",
+        last.unwrap_or_else(|| "<none>".into())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_transport_reconnect() {
     // Two bare transport nodes (no validators): we drive the wire directly.
@@ -130,10 +158,16 @@ async fn quic_transport_reconnect() {
 
     // Crash node 1's transport, then rebind it to the SAME address.
     nodes[1] = None;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut node1b = rebind_node(ValidatorId(1), addrs[1], addrs.clone())
-        .await
-        .expect("rebind node 1");
+
+    // Rebinding races the OS releasing the UDP port. A fixed sleep here is a
+    // guess about how fast the machine is: under load this failed with
+    // `EADDRINUSE` roughly one run in five, because 200 ms was not long enough
+    // for the dropped endpoint's tasks to finish tearing the socket down.
+    //
+    // So retry until the port is genuinely free. The deadline is generous
+    // because it is only reached when the port is never released, which is a
+    // real failure rather than a slow machine.
+    let mut node1b = rebind_with_retry(ValidatorId(1), addrs[1], &addrs).await;
     let mut inbox1b = node1b.take_inbox();
     nodes[1] = Some(node1b);
 

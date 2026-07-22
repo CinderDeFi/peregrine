@@ -84,9 +84,6 @@ pub struct Committer {
     pub commits: u64,
     /// Skipped anchors (metrics).
     pub skips: u64,
-    /// How far ahead the indirect rule may scan for a deciding anchor.
-    /// Purely a work bound; correctness does not depend on its value.
-    indirect_scan_limit: Round,
 }
 
 impl Committer {
@@ -96,7 +93,6 @@ impl Committer {
             committed: HashSet::new(),
             commits: 0,
             skips: 0,
-            indirect_scan_limit: 512,
         }
     }
 
@@ -194,8 +190,12 @@ impl Committer {
             .and_then(|m| m.get(&Self::anchor_for_round(dag, r)))
             .copied();
 
-        let highest = dag.highest_round();
-        let scan_end = (r + 3 + self.indirect_scan_limit).min(highest);
+        // AUDIT L-1: scan to the DAG frontier, not to a fixed `r + 3 + limit`
+        // offset. `highest` already bounds the work, and a fixed window could
+        // permanently strand an Undecided anchor whose deciding commit first
+        // appears beyond it — a (remote) liveness hazard. The scan is naturally
+        // bounded by the frontier and re-runs cheaply as the DAG grows.
+        let scan_end = dag.highest_round();
         let mut r2 = r + 3;
         while r2 <= scan_end {
             if self.direct_decision(dag, r2) == Decision::Commit {

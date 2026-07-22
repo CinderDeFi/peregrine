@@ -113,6 +113,8 @@
     <nav>
       <span class="brand">PEREGRINE</span>
       <a href="why.html">Why</a>
+      <a href="#launch">Launch</a>
+      <a href="#milestone">Milestone</a>
       <a href="#what">What it is</a>
       <a href="#try">Try it</a>
       <a href="#performance">Performance</a>
@@ -139,10 +141,12 @@
       <a class="btn ghost" href="https://github.com/peregrine-labs/peregrine">GitHub</a>
     </div>
     <div class="badges">
+      <span class="badge">v0.1 · public</span>
       <span class="badge">Apache-2.0</span>
       <span class="badge">Rust 1.85+</span>
-      <span class="badge">184 Rust tests</span>
-      <span class="badge">41 Solidity tests</span>
+      <span class="badge">222 Rust tests</span>
+      <span class="badge">48 Solidity tests</span>
+      <span class="badge">60 TypeScript tests</span>
       <span class="badge warn">unaudited · holds no value</span>
     </div>
   </div>
@@ -157,6 +161,60 @@
       lists what is deliberately unsafe.
     </p>
   </div>
+
+  <section id="launch">
+    <h2>v0.1 is public</h2>
+    <p class="muted">
+      The whole scaffold — consensus, streams, the VM, both bridge directions,
+      and the three-language verifier set — is on GitHub under Apache-2.0. The
+      fastest way to judge it is to run it: the ten-second demo below stands up a
+      real 4-validator network and walks every subsystem end to end.
+    </p>
+    <div class="cta" style="margin-top:20px">
+      <a class="btn primary" href="#try">Run the demo</a>
+      <a class="btn ghost" href="https://github.com/peregrine-labs/peregrine/blob/main/docs/RELEASE_NOTES.md">Release notes</a>
+      <a class="btn ghost" href="https://github.com/peregrine-labs/peregrine/blob/main/AUDIT.md">Audit package</a>
+    </div>
+    <p class="muted" style="margin-top:20px; font-size:.9rem">
+      Published to be read, run, and criticised — not to be trusted. It has never
+      been third-party audited, has never been deployed, holds no value, and has
+      no token. The limitations list is longer than the pitch, on purpose.
+    </p>
+  </section>
+
+  <section id="milestone">
+    <h2>Milestone: the loop is closed, end to end</h2>
+    <p class="muted">
+      The two directions of the bridge now meet real cryptography with no mock
+      in the path:
+    </p>
+    <div class="grid" style="margin-top:24px">
+      <div class="card">
+        <h3>Ethereum → Peregrine</h3>
+        <p>A real SP1 proof of Ethereum state is verified <em>inside the commit
+        path</em> — on every validator, in ~52 ms. Proving takes minutes and
+        happens once, off-chain.</p>
+      </div>
+      <div class="card">
+        <h3>Peregrine → Ethereum</h3>
+        <p>The EVM light client is wired to SP1's <em>real on-chain Groth16
+        verifier</em> (vendored at the exact circuit version), doing the full
+        BN254 pairing. <span data-groth16-status>A genuine proof of Peregrine
+        state, from the real prover, is verified on-chain by that verifier for
+        ~418k gas — no mock in the path.</span></p>
+      </div>
+      <div class="card">
+        <h3>Audit-hardened</h3>
+        <p>An internal review of the consensus-critical surface found and fixed
+        a release-only consensus check, plus five lower-severity items — all
+        recorded with resolutions in <code>AUDIT.md</code>.</p>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:20px; font-size:.9rem">
+      Still unaudited by a third party, still holds no value. This is the
+      scaffold reaching feature-completeness, not a production launch.
+    </p>
+  </section>
 
   <section id="what">
     <h2>Verify, don't trust</h2>

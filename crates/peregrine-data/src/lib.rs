@@ -17,6 +17,8 @@
 
 pub mod fees;
 pub mod merkle;
+#[cfg(feature = "streams")]
+pub mod sessions;
 pub mod smt;
 pub mod smt_v2;
 #[cfg(feature = "streams")]

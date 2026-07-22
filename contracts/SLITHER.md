@@ -6,7 +6,7 @@ including the ones deliberately not changed.
 ```
 slither 0.11.5
 solc   0.8.28  (--optimize --optimize-runs 200)
-date   2026-07-21
+date   2026-07-21 (re-run; contract unchanged in findings after the treeVersion pin was added)
 ```
 
 ## Reproducing

@@ -149,7 +149,17 @@ impl TilePool {
                     // The tile loop: block, work, push. It ends when the pool
                     // is dropped and the queue disconnects.
                     while let Ok(Dispatch { job, reply }) = rx.recv() {
-                        let ok = job.run();
+                        // AUDIT I-4: verification runs inside `catch_unwind`. A
+                        // panic in `job.run()` (which `crypto::verify` does not do
+                        // on the length-validated inputs it receives, but a future
+                        // change might) would otherwise kill the tile and leave the
+                        // job's reply unsent — and *which* job that hit would depend
+                        // on scheduling, a determinism hazard. Instead a panicking
+                        // job resolves deterministically to `false` (unverified,
+                        // fail-closed) and the tile lives on.
+                        let ok =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                                .unwrap_or(false);
                         m.jobs.fetch_add(1, Ordering::Relaxed);
                         // A dropped receiver just means that batch's caller went
                         // away (task cancelled); other batches are unaffected.
@@ -237,42 +247,66 @@ impl TilePool {
 
         let tx = self.tx.as_ref().expect("checked above");
 
-        // A reply channel for *this batch alone*, sized to hold every verdict.
-        // Because it can never fill, a tile never blocks on send, so it always
-        // returns to draining the work queue — which is what makes the
-        // "push everything, then collect" loop below deadlock-free even when
-        // the batch is far larger than the bounded work queue.
-        let (reply, results) = bounded::<(usize, bool)>(n);
+        // AUDIT L-3: the dispatch+collect below blocks the calling thread on
+        // crossbeam channels while the tiles work. When that caller is a tokio
+        // worker (the commit path runs inside the validator's async task),
+        // blocking it directly would starve the runtime. `block_in_place` hands
+        // this worker's other tasks to a sibling for the duration — but it is
+        // only valid on a multi-thread runtime, and panics off a runtime or on a
+        // current-thread one (e.g. the unit tests here). So it is applied only
+        // when we can confirm we are on a multi-thread runtime; otherwise the
+        // plain blocking path runs unchanged. The verdicts are identical either
+        // way — this changes scheduling, never results.
+        maybe_block_in_place(move || {
+            // A reply channel for *this batch alone*, sized to hold every verdict.
+            // Because it can never fill, a tile never blocks on send, so it always
+            // returns to draining the work queue — which is what makes the
+            // "push everything, then collect" loop below deadlock-free even when
+            // the batch is far larger than the bounded work queue.
+            let (reply, results) = bounded::<(usize, bool)>(n);
 
-        for job in jobs {
-            // Blocks only while every tile is busy, which is precisely the
-            // backpressure we want: the caller waits rather than queueing
-            // unbounded work.
-            tx.send(Dispatch {
-                job,
-                reply: reply.clone(),
-            })
-            .expect("pool owns its tiles");
-        }
-        // Drop our own handle so the channel closes once the tiles finish;
-        // without this a lost job would hang the collect loop forever instead
-        // of surfacing as a disconnect.
-        drop(reply);
-
-        let mut collected = 0usize;
-        while collected < n {
-            match results.recv() {
-                Ok((idx, ok)) => {
-                    out[idx] = ok;
-                    collected += 1;
-                }
-                // Every tile dropped its sender without answering. Cannot happen
-                // while the pool is alive, and if it somehow did, the safe
-                // reading of a missing verdict is "not verified".
-                Err(_) => break,
+            for job in jobs {
+                // Blocks only while every tile is busy, which is precisely the
+                // backpressure we want: the caller waits rather than queueing
+                // unbounded work.
+                tx.send(Dispatch {
+                    job,
+                    reply: reply.clone(),
+                })
+                .expect("pool owns its tiles");
             }
-        }
-        out
+            // Drop our own handle so the channel closes once the tiles finish;
+            // without this a lost job would hang the collect loop forever instead
+            // of surfacing as a disconnect.
+            drop(reply);
+
+            let mut collected = 0usize;
+            while collected < n {
+                match results.recv() {
+                    Ok((idx, ok)) => {
+                        out[idx] = ok;
+                        collected += 1;
+                    }
+                    // Every tile dropped its sender without answering. Cannot
+                    // happen while the pool is alive, and if it somehow did, the
+                    // safe reading of a missing verdict is "not verified".
+                    Err(_) => break,
+                }
+            }
+            out
+        })
+    }
+}
+
+/// Run `f`, yielding the current tokio worker via `block_in_place` when — and
+/// only when — that is valid (a multi-thread runtime). Off a runtime, or on a
+/// current-thread runtime, `block_in_place` would panic, so `f` simply runs
+/// in place. See AUDIT L-3.
+fn maybe_block_in_place<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
     }
 }
 

@@ -5,6 +5,8 @@
 //! Slipstream shred or a Talon transaction. One enum, one codec, so the
 //! execution pipeline has a single decode point.
 
+use peregrine_core::{Hash, Signature};
+use peregrine_data::sessions::{SignedAction, SignedGrant};
 use peregrine_data::streams::StreamShred;
 use peregrine_interop::VerifiedClaim;
 use peregrine_vm::Instr;
@@ -24,6 +26,21 @@ pub enum WirePayload {
     /// deterministic function of the payload and the node's pinned
     /// configuration.
     ForeignClaim(Box<VerifiedClaim>),
+    /// A principal delegates to a session key (see [`peregrine_data::sessions`]).
+    ///
+    /// Boxed because a grant carries two public keys plus a scope list, and an
+    /// unboxed variant would make every payload as large as the biggest one.
+    OpenSession(Box<SignedGrant>),
+    /// A principal revokes one of its sessions. Signed by the **principal**,
+    /// never the session key — a compromised session must not be able to
+    /// manipulate its own revocation.
+    RevokeSession {
+        session_id: Hash,
+        /// Principal's signature over `REVOKE_DOMAIN || session_id`.
+        signature: Signature,
+    },
+    /// An action authorised by a session key.
+    SessionAction(Box<SignedAction>),
 }
 
 impl WirePayload {

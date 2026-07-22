@@ -53,7 +53,7 @@ A working end-to-end system, demonstrable in ten seconds on a laptop:
 | Execution | Metered stack VM — dual meter for compute **and** data bytes |
 | Interop | Ethereum headers + MPT proofs verified in SP1; BLS beacon anchoring; reciprocal Solidity client |
 | Clients | Rust SDK, TypeScript light client, EVM verifier contract |
-| Tests | 184 Rust · 41 Solidity · 41 TypeScript |
+| Tests | 222 Rust · 48 Solidity · 60 TypeScript |
 
 ```bash
 peregrine demo     # streams, VM, light client, and interop — end to end
@@ -96,7 +96,7 @@ rather than asserted**:
 
 ## What it is not
 
-- **Not audited.** No third party has reviewed it.
+- **Not third-party audited.** An internal security review was done (findings + resolutions in `AUDIT.md`); no external audit yet.
 - **Not deployed.** No testnet, no mainnet, no token, nothing to buy.
 - **Not economically complete.** Equivocation is detected but not slashed;
   fees exist but are unmodelled.

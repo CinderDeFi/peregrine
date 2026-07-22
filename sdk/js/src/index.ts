@@ -42,3 +42,28 @@ export {
   toHex,
   type Bytes,
 } from "./hash.ts";
+
+export {
+  ACTION_DOMAIN,
+  encodeAction,
+  encodeGrant,
+  GRANT_DOMAIN,
+  id32FromHex,
+  publicKeyOf,
+  REVOKE_DOMAIN,
+  SessionBuilder,
+  SessionSigner,
+  sessionId,
+  signAction,
+  signGrant,
+  signRevocation,
+  type Action,
+  type Id32,
+  type Scope,
+  type SessionAction,
+  type SessionGrant,
+  type SignedAction,
+  type SignedGrant,
+} from "./sessions.ts";
+
+export { BincodeWriter, encode as bincodeEncode } from "./bincode.ts";

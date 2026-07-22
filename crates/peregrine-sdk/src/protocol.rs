@@ -4,7 +4,7 @@
 //! fresh QUIC bidirectional stream. Defined here (not in the node) so the SDK
 //! owns the contract and the node depends on *it* to serve the same shapes.
 
-use peregrine_core::Hash;
+use peregrine_core::{Hash, Signature};
 use peregrine_data::streams::StreamShred;
 use peregrine_data::tables::{ProvenRead, TableId};
 use peregrine_interop::VerifiedClaim;
@@ -41,6 +41,15 @@ pub enum RpcRequest {
     /// layer must do is stop a *flood* of them from crowding out consensus
     /// traffic — see the rate limiting in `peregrine-node::rpc`.
     SubmitClaim(Box<VerifiedClaim>),
+    /// Open a session (a principal's signed delegation to a session key).
+    OpenSession(Box<peregrine_data::sessions::SignedGrant>),
+    /// An action authorised by a session key.
+    SessionAction(Box<peregrine_data::sessions::SignedAction>),
+    /// Revoke a session. Signed by the principal.
+    RevokeSession {
+        session_id: Hash,
+        signature: Signature,
+    },
     /// Ask for a value plus an inclusion proof against the current store root.
     ProveRead { table: TableId, key: Vec<u8> },
     /// Ask for the node's current 32-byte store root.
@@ -74,16 +83,31 @@ pub async fn write_frame(send: &mut quinn::SendStream, bytes: &[u8]) -> std::io:
     Ok(())
 }
 
-/// Read one length-prefixed frame from a QUIC recv stream.
+/// Read one length-prefixed frame, rejecting anything larger than [`MAX_FRAME`].
 pub async fn read_frame(recv: &mut quinn::RecvStream) -> std::io::Result<Vec<u8>> {
+    read_frame_capped(recv, MAX_FRAME).await
+}
+
+/// Read one length-prefixed frame, rejecting anything larger than `max`
+/// **before allocating**.
+///
+/// AUDIT I-1: the length prefix is checked against `max` before the buffer is
+/// sized, so a peer cannot force an allocation larger than the caller is willing
+/// to accept. Callers that know a tighter bound than [`MAX_FRAME`] (the RPC
+/// server accepts at most [`MAX_CLAIM_BYTES`]) should pass it here rather than
+/// allocating up to 64 MiB for a request they will reject anyway.
+pub async fn read_frame_capped(
+    recv: &mut quinn::RecvStream,
+    max: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len)
         .await
         .map_err(std::io::Error::other)?;
     let n = u32::from_le_bytes(len) as usize;
-    if n > MAX_FRAME {
+    if n > max {
         return Err(std::io::Error::other(format!(
-            "frame length {n} exceeds cap {MAX_FRAME}"
+            "frame length {n} exceeds cap {max}"
         )));
     }
     let mut buf = vec![0u8; n];

@@ -37,7 +37,9 @@ use crate::payload::WirePayload;
 use crate::quic::dev_endpoint;
 use crate::rpc_limits::{cost, RpcLimits, TokenBucket};
 use crate::validator::Query;
-use peregrine_sdk::protocol::{read_frame, write_frame, RpcRequest, RpcResponse, MAX_CLAIM_BYTES};
+use peregrine_sdk::protocol::{
+    read_frame_capped, write_frame, RpcRequest, RpcResponse, MAX_CLAIM_BYTES,
+};
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
@@ -142,7 +144,11 @@ async fn serve_stream(
     limits: RpcLimits,
     bucket: std::sync::Arc<std::sync::Mutex<TokenBucket>>,
 ) -> anyhow::Result<()> {
-    let bytes = read_frame(&mut recv).await?;
+    // AUDIT I-1: cap the read at MAX_CLAIM_BYTES up front, so a client cannot
+    // force a larger allocation than the server will ever accept. The redundant
+    // post-read length check below stays as defence in depth and to return a
+    // clean protocol error rather than a transport error.
+    let bytes = read_frame_capped(&mut recv, MAX_CLAIM_BYTES).await?;
 
     // Size-check before deserializing: a request must not get to decide how
     // much memory we allocate.
@@ -179,6 +185,11 @@ fn request_cost(req: &RpcRequest) -> u32 {
         RpcRequest::ProveRead { .. } | RpcRequest::StoreRoot => cost::QUERY,
         RpcRequest::Publish(_) | RpcRequest::SubmitTx(_) => cost::SUBMIT,
         RpcRequest::SubmitClaim(_) => cost::CLAIM,
+        // A session action is one signature to verify and one policy check —
+        // the same order of work as any other submission. Opening a session
+        // costs more: it is a signature plus permanent state.
+        RpcRequest::SessionAction(_) | RpcRequest::RevokeSession { .. } => cost::SUBMIT,
+        RpcRequest::OpenSession(_) => cost::SUBMIT * 2,
     }
 }
 
@@ -202,6 +213,26 @@ async fn dispatch(
         RpcRequest::SubmitTx(program) => {
             accept(ingest_tx.send(WirePayload::TalonTx { program }).await)
         }
+
+        RpcRequest::OpenSession(grant) => {
+            accept(ingest_tx.send(WirePayload::OpenSession(grant)).await)
+        }
+
+        RpcRequest::SessionAction(action) => {
+            accept(ingest_tx.send(WirePayload::SessionAction(action)).await)
+        }
+
+        RpcRequest::RevokeSession {
+            session_id,
+            signature,
+        } => accept(
+            ingest_tx
+                .send(WirePayload::RevokeSession {
+                    session_id,
+                    signature,
+                })
+                .await,
+        ),
 
         RpcRequest::SubmitClaim(claim) => {
             // Straight onto the same ingest queue as everything else: the

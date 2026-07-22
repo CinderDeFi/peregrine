@@ -14,9 +14,23 @@ use peregrine_data::streams::Publisher;
 use peregrine_node::payload::WirePayload;
 use peregrine_node::pipeline::ExecutionPipeline;
 use peregrine_node::quic::{quic_cluster, QuicNode};
-use peregrine_node::validator::{run_validator, NodeReport, ValidatorConfig};
-use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use peregrine_node::validator::{run_validator, NodeReport, Query, ValidatorConfig};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot, watch};
+
+/// Ceiling before we stop believing the survivors are merely slow. Only reached
+/// on a genuine liveness failure; a healthy run exits the poll far sooner.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Current store root of a live validator, or `None` if it did not answer.
+async fn store_root(q: &mpsc::Sender<Query>) -> Option<peregrine_core::Hash> {
+    let (tx, rx) = oneshot::channel();
+    q.send(Query::StoreRoot { reply: tx }).await.ok()?;
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .ok()?
+        .ok()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn survivors_stay_live_when_one_validator_crashes() {
@@ -49,6 +63,7 @@ async fn survivors_stay_live_when_one_validator_crashes() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut ingest_txs: Vec<Option<mpsc::Sender<WirePayload>>> = Vec::new();
+    let mut query_txs: Vec<mpsc::Sender<Query>> = Vec::new();
     let mut handles = Vec::new();
 
     for (kp, slot) in keypairs.into_iter().zip(nodes.iter_mut()) {
@@ -66,6 +81,8 @@ async fn survivors_stay_live_when_one_validator_crashes() {
             .register("test/feed", publisher.public_key());
         let (ingest_tx, ingest_rx) = mpsc::channel(4096);
         ingest_txs.push(Some(ingest_tx));
+        let (query_tx, query_rx) = mpsc::channel::<Query>(256);
+        query_txs.push(query_tx);
         handles.push(tokio::spawn(run_validator(ValidatorConfig {
             id,
             keypair: kp,
@@ -77,9 +94,20 @@ async fn survivors_stay_live_when_one_validator_crashes() {
             pipeline,
             max_items_per_vertex: 64,
             store: None,
-            query_rx: None,
+            query_rx: Some(query_rx),
         })));
     }
+
+    // A freshly-initialised store already has a non-zero root — the store-level
+    // Merkle tree is built over the (empty) system tables. So "root != ZERO" is
+    // NOT evidence of a commit; progress means the root *changing* from this
+    // baseline. Capture it before feeding anything.
+    let baseline = loop {
+        if let Some(r) = store_root(&query_txs[0]).await {
+            break r;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
 
     // Feed ticks to a live validator (id 0).
     let live_tx = ingest_txs[0].as_ref().expect("v0 is live").clone();
@@ -88,8 +116,37 @@ async fn survivors_stay_live_when_one_validator_crashes() {
         live_tx.send(WirePayload::Shred(shred)).await.unwrap();
     }
 
-    // A little longer than the in-process version to absorb QUIC handshakes.
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Wait for the survivors to actually make progress, rather than sleeping a
+    // fixed interval and hoping. The condition is that all three report the
+    // *same* non-zero store root — which proves they committed (liveness),
+    // agreed (safety), and, because progress past validator 2's anchor rounds
+    // is impossible without skipping them, that the skip cascade fired. A fixed
+    // 3 s sleep flaked here under load when QUIC handshakes plus commit did not
+    // finish in time; this cannot, because it exits the moment the chain is
+    // demonstrably alive and waits out a slow machine otherwise.
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
+    let mut converged = false;
+    while Instant::now() < deadline {
+        let mut roots = Vec::with_capacity(query_txs.len());
+        for q in &query_txs {
+            roots.push(store_root(q).await);
+        }
+        if let Some(Some(first)) = roots.first().copied() {
+            // Converged on a root that has *moved past the baseline*, i.e. real
+            // committed records — not just the empty-tables root everyone starts
+            // on.
+            if first != baseline && roots.iter().all(|r| *r == Some(first)) {
+                converged = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        converged,
+        "survivors did not converge on committed state within {LIVENESS_TIMEOUT:?} —          a real liveness failure, not a slow machine"
+    );
+
     shutdown_tx.send(true).unwrap();
     drop(ingest_txs);
 

@@ -15,6 +15,13 @@ pub enum DagError {
     MissingParent(Hash, Hash),
     #[error("parents of vertex {0:?} do not form a stake quorum")]
     InsufficientParentQuorum(Hash),
+    #[error("vertex {vertex:?} has parent {parent:?} at round {parent_round}, expected {expected_round} (DAG must be layered)")]
+    NonLayeredParent {
+        vertex: Hash,
+        parent: Hash,
+        parent_round: Round,
+        expected_round: Round,
+    },
     #[error("vertex verification failed: {0}")]
     InvalidVertex(String),
     #[error("unknown author {0:?}")]
@@ -88,7 +95,22 @@ impl Dag {
             let mut parent_authors: Vec<ValidatorId> = Vec::new();
             for p in &vertex.header.parents {
                 let pv = self.vertices.get(p).ok_or(DagError::MissingParent(h, *p))?;
-                debug_assert_eq!(pv.header.round, round - 1, "parent from wrong round");
+                // AUDIT H-1: the DAG must be layered — every parent of a round-`r`
+                // vertex sits at round `r-1`. This is load-bearing: the commit
+                // rule's safety argument (see `committer.rs`) assumes it when it
+                // reasons that an anchor's causal history holds a stake quorum at
+                // *every* round below it, and `Dag::reaches` assumes parents
+                // strictly decrease in round. A `debug_assert` here compiled the
+                // check out of release builds, letting a Byzantine author submit a
+                // signed vertex with cross-round parents. It is now a hard error.
+                if pv.header.round != round - 1 {
+                    return Err(DagError::NonLayeredParent {
+                        vertex: h,
+                        parent: *p,
+                        parent_round: pv.header.round,
+                        expected_round: round - 1,
+                    });
+                }
                 parent_authors.push(pv.header.author);
             }
             parent_authors.sort();
@@ -237,5 +259,86 @@ impl Dag {
 
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vertex::{Payload, Vertex};
+    use peregrine_core::{Keypair, ValidatorInfo};
+
+    fn committee(keys: &[Keypair]) -> Committee {
+        Committee::new(
+            keys.iter()
+                .enumerate()
+                .map(|(i, kp)| ValidatorInfo {
+                    id: ValidatorId(i as u16),
+                    public_key: kp.public(),
+                    stake: 100,
+                })
+                .collect(),
+        )
+    }
+
+    /// AUDIT H-1: a signed vertex whose parents skip a round must be rejected in
+    /// **every** build, not only in debug. Before the fix this was a
+    /// `debug_assert` and the vertex was accepted in release.
+    #[test]
+    fn a_vertex_with_a_non_layered_parent_is_rejected() {
+        let mut rng = rand::rngs::OsRng;
+        let keys: Vec<Keypair> = (0..4).map(|_| Keypair::generate(&mut rng)).collect();
+        let mut dag = Dag::new(committee(&keys), vec![]);
+
+        // Round 0: a full genesis quorum.
+        let mut r0: Vec<Hash> = Vec::new();
+        for (i, kp) in keys.iter().enumerate() {
+            let v = Vertex::new_signed(kp, ValidatorId(i as u16), 0, vec![], Payload::default());
+            r0.push(dag.insert(v).expect("genesis inserts"));
+        }
+
+        // A round-*2* vertex whose parents are the round-0 genesis quorum — a
+        // real stake quorum, correctly signed, but from the wrong round. It must
+        // be refused because it is not layered onto round 1.
+        let evil = Vertex::new_signed(&keys[0], ValidatorId(0), 2, r0.clone(), Payload::default());
+        let err = dag
+            .insert(evil)
+            .expect_err("non-layered parent must be rejected");
+        assert!(
+            matches!(
+                err,
+                DagError::NonLayeredParent {
+                    parent_round: 0,
+                    expected_round: 1,
+                    ..
+                }
+            ),
+            "expected NonLayeredParent, got {err:?}"
+        );
+    }
+
+    /// The honest, layered path still works: round-1 parents for a round-2 vertex.
+    #[test]
+    fn a_correctly_layered_vertex_is_accepted() {
+        let mut rng = rand::rngs::OsRng;
+        let keys: Vec<Keypair> = (0..4).map(|_| Keypair::generate(&mut rng)).collect();
+        let mut dag = Dag::new(committee(&keys), vec![]);
+
+        let mut r0: Vec<Hash> = Vec::new();
+        for (i, kp) in keys.iter().enumerate() {
+            let v = Vertex::new_signed(kp, ValidatorId(i as u16), 0, vec![], Payload::default());
+            r0.push(dag.insert(v).expect("genesis"));
+        }
+        let mut r1: Vec<Hash> = Vec::new();
+        for (i, kp) in keys.iter().enumerate() {
+            let v =
+                Vertex::new_signed(kp, ValidatorId(i as u16), 1, r0.clone(), Payload::default());
+            r1.push(dag.insert(v).expect("round 1 layers onto round 0"));
+        }
+        let v2 = Vertex::new_signed(&keys[0], ValidatorId(0), 2, r1.clone(), Payload::default());
+        assert!(
+            dag.insert(v2).is_ok(),
+            "a layered round-2 vertex is accepted"
+        );
     }
 }

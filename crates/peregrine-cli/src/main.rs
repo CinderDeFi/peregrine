@@ -208,6 +208,11 @@ enum ExampleName {
     SubmitTx,
     /// Verify a read against the store root, then try to forge it.
     LightClient,
+    /// An autonomous agent buying a data feed with a scoped, budgeted,
+    /// revocable session key.
+    Agent,
+    /// RWA contract templates: title, valuation, proven-collateral health.
+    RwaTemplates,
 }
 
 #[derive(Args)]
@@ -311,6 +316,8 @@ async fn run_async(cmd: Command, cfg: Config) -> Result<()> {
             ExampleName::PublishStream => peregrine_node::demos::publish_stream().await,
             ExampleName::SubmitTx => peregrine_node::demos::submit_tx().await,
             ExampleName::LightClient => peregrine_node::demos::light_client().await,
+            ExampleName::Agent => peregrine_node::demos::agent().await,
+            ExampleName::RwaTemplates => peregrine_node::demos::rwa_templates().await,
         },
         Command::SubmitTx(args) => run_submit_tx(args, cfg).await,
         Command::Watch(args) => {

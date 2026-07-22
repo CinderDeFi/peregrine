@@ -124,6 +124,12 @@ fn a_real_groth16_proof_of_peregrine_state() {
         "keyHash": format!("0x{}", hex::encode(proof.journal.key_hash.0)),
         "chainId": proof.journal.chain_id,
         "round": proof.journal.round,
+        // The Merkle tree version the store root was computed under. Added to
+        // the journal (and pinned by the EVM client) in the v2 upgrade; the
+        // Solidity e2e reads it to construct the client with the matching pin.
+        // Emitted here so the generated fixture is self-describing rather than
+        // relying on a default.
+        "treeVersion": proof.journal.tree_version,
         "value": format!("0x{}", hex::encode(proof.journal.value)),
         "valueLen": proof.journal.value_len,
         "expectedUint": 42,

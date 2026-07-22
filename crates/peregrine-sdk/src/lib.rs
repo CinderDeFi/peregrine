@@ -42,6 +42,11 @@ pub use client::{Client, SdkError};
 pub use peregrine_core::{Hash, Keypair, PublicKey, Signature, ValidatorId};
 pub use peregrine_data::streams::{Publisher, StreamId, StreamRecord, StreamShred};
 pub use peregrine_data::tables::{ProvenAbsence, ProvenRead, RangeProof, TableId};
+// ── agent sessions & micropayments ──────────────────────────────────────────
+// Re-exported so an agent depends only on `peregrine-sdk`.
+pub use peregrine_data::sessions::{
+    Action, Grains, Scope, SessionBuilder, SessionGrant, SessionSigner, SignedAction, SignedGrant,
+};
 pub use peregrine_vm::Instr;
 
 // ── cross-chain verification (pure, local) ──────────────────────────────────

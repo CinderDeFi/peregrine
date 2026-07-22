@@ -32,5 +32,6 @@ pub mod rpc;
 pub mod rpc_limits;
 pub mod sim;
 pub mod store;
+pub mod templates;
 pub mod tiles;
 pub mod validator;

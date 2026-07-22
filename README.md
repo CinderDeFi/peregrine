@@ -15,7 +15,7 @@
 **[peregrine-labs.github.io/peregrine](https://peregrine-labs.github.io/peregrine/)** — overview, benchmarks, and demo instructions.
 
 📋 **Reviewing this code?** Start with **[AUDIT.md](AUDIT.md)** — scope, trust
-boundaries, sixteen named invariants, a threat model, and a ranked list of what
+boundaries, nineteen named invariants, a threat model, and a ranked list of what
 to attack first. One page on the idea: **[docs/PITCH.md](docs/PITCH.md)**.
 
 A data-native, real-time Layer-1. This repository is the **solo bootstrap
@@ -73,6 +73,148 @@ a contract reads WETH.decimals() with nothing proven yet:
 Act 4 is the one to watch: the default path **refuses**, because nothing has
 been proven. The demo then shows the success path explicitly labelled insecure,
 so the difference is impossible to miss.
+
+### Agents: scoped keys and streaming micropayments
+
+```bash
+peregrine sdk example agent
+```
+
+An autonomous agent needs to act continuously without holding a key that can
+drain its owner. A **session key** is a bounded delegation: the principal signs
+a grant, and consensus — not the agent's good behaviour — enforces the bounds.
+
+```rust
+let grant = SessionBuilder::new(expires_at_round)   // a round, not a clock
+    .allow_table(TableId::named("agent.notes"))     // everything starts closed
+    .allow_stream(feed)
+    .budget(50)                                    // total it may ever spend
+    .max_per_action(5)                             // and never this much at once
+    .sign(&principal, &agent_key.public());
+
+client.open_session(grant).await?;
+```
+
+Then the agent buys a data feed. **One signature opens a subscription; after
+that, payment happens on the fast path** — one debit per committed record, no
+further signatures, credited to the publisher in the same commit:
+
+```rust
+let mut signer = SessionSigner::new(agent_key, session_id);
+client.session_action(signer.sign(Action::Subscribe {
+    stream: feed,
+    price_per_record: 2,
+})).await?;
+```
+
+**The same flow in TypeScript**, so a browser or edge agent can hold its own
+session key:
+
+```ts
+import { SessionBuilder, SessionSigner, sessionId, tableId } from "@peregrine/sdk";
+
+const grant = new SessionBuilder(currentRound + 500n)   // a round, not a clock
+  .allowTable(tableId("agent.notes"))
+  .allowStream(priceFeed)
+  .budget(50n)
+  .maxPerAction(5n)
+  .sign(principalSecret, agentPublic);
+
+const signer = new SessionSigner(agentSecret, sessionId(grant.grant));
+await client.sessionAction(signer.sign({
+  kind: "subscribe", stream: priceFeed, pricePerRecord: 2n,
+}));
+```
+
+Grants are signed over their **bincode** encoding, so TypeScript has to
+reproduce Rust's byte layout exactly — one wrong length prefix yields a
+well-formed signature that every validator rejects, with nothing in the error
+to say why. `sdk/js/src/bincode.ts` implements the subset Peregrine signs, and
+the tests assert **byte equality against Rust-generated fixtures** rather than
+merely that a signature verifies. ed25519 is deterministic (RFC 8032), so a
+matching signature is proof the encoding beneath it is right.
+
+```bash
+node sdk/js/examples/agent-session.ts   # build and sign a session, offline
+```
+
+```text
+── act 2 · what the agent cannot do ──────────────────────
+  write to treasury.reserve … ✓ as expected   (table not in session scope)
+  pay 40 (cap is 5)         … ✓ as expected   (exceeds per-action cap)
+
+── act 3 · streaming micropayments ───────────────────────
+  8 records committed       → agent spent 16 grains, oracle earned 16
+
+── act 4 · the budget is a hard ceiling ──────────────────
+  40 more records committed … the stream keeps flowing
+  agent spent               : 50 of 50 — never more  ✓ as expected
+
+── act 5 · revocation ────────────────────────────────────
+  principal revoked         … meter stopped ✓ as expected
+```
+
+Four properties are worth calling out, because each is a way this could have
+gone wrong:
+
+* **TTL is measured in committed rounds, never wall-clock time.** Two
+  validators reading their own clocks would expire a session at different
+  points in the committed order and *fork the chain*. Rounds are the only clock
+  every validator already agrees on.
+* **A refused action leaves nothing behind** — no debit, no nonce bump, no
+  partial write. Otherwise an attacker could burn a session's nonce space or
+  drain its budget with actions that never take effect.
+* **An exhausted budget degrades, it does not halt.** The agent stops paying
+  and stops being owed data; the chain keeps committing records.
+* **Only the principal can revoke.** A compromised session key cannot revoke
+  itself, and more importantly cannot interfere with its own revocation.
+
+The scope is an allow-list, never a deny-list: a session that defaulted to
+"everything except…" would silently gain new powers every time the protocol
+gained a feature — the opposite of what a delegation should do.
+
+⚠️ **Session state is consensus state.** Grants, budgets, and subscriptions
+live in `sys.sessions` and balances in `sys.balances`, both materialized and
+provable like any other table — so an agent can *prove* what it is allowed to
+do rather than being told.
+
+### RWA contract templates
+
+```bash
+peregrine sdk example rwa-templates
+```
+
+[`templates.rs`](crates/peregrine-node/src/templates.rs) ships ready-made
+TalonVM programs for the patterns that keep recurring — property title,
+oracle valuation, collateral health against a **proven** Ethereum balance, and
+a reserve-backed token — so an integrator does not hand-assemble opcodes to do
+something ordinary.
+
+```rust
+let program = collateral_health(property_id, /* ratio */ 30, CHAIN, USDC, slot);
+client.submit_tx(program).await?;
+```
+
+```text
+── act 2 · the check that must NOT default to zero ───────
+  verdict with UNPROVEN collateral … ✓ as expected
+     (the tx trapped — an unproven balance is not a balance,
+      so no verdict is written and the last one stands)
+
+── act 3 · with a proven balance ─────────────────────────
+  collateral $200,000 (ample)   → HEALTHY
+  collateral $100,000 (short)   → UNDER-COLLATERALISED
+```
+
+Every template that touches foreign state uses `LoadEthState`, which **traps**
+on unproven data rather than pushing zero. That is the whole reason these are
+worth templating: the naive collateral check reads a balance, gets `0` because
+the oracle was down, and marks an under-collateralised loan healthy. Here the
+transaction aborts and the previous verdict stands — a missing fact produces no
+verdict rather than a wrong one.
+
+⚠️ These are **templates, not audited financial contracts**. They are
+deliberately small enough to read in full before you trust one.
 
 ### A worked example: tokenized real-world assets
 
@@ -170,6 +312,8 @@ node's word alone isn't good enough.
 peregrine sdk example publish-stream   # publish signed ticks
 peregrine sdk example submit-tx        # run a Talon program
 peregrine sdk example light-client     # verify, then try to forge
+peregrine sdk example agent            # scoped session keys + micropayments
+peregrine sdk example rwa-templates    # RWA contracts vs. proven Ethereum state
 
 cd sdk/js && npm install && npm test   # TypeScript light client
 ```
@@ -181,19 +325,19 @@ targets if you prefer.)
 ### Develop
 
 ```bash
-cargo test                                        # 184 tests, all crates
+cargo test                                        # 222 tests, all crates
 cargo test -p peregrine-interop --features bls    # + real BLS / mainnet fixtures
-cd contracts && forge test                        # EVM verifier (41 Foundry tests)
-cd sdk/js && npm install && npm test              # TypeScript light client (41 tests, v1+v2)
+cd contracts && forge test                        # EVM verifier (48 Foundry tests, incl. real Groth16 e2e)
+cd sdk/js && npm install && npm test              # TypeScript light client + sessions (60 tests)
 make ci                                           # everything CI runs
 ```
 
 | Suite | Count | What it covers |
 | --- | --- | --- |
-| Rust (default) | 184 | consensus, data plane, VM, persistence, QUIC, SDK, CLI, tile pipeline, Merkle migration |
+| Rust (default) | 222 | consensus, data plane, VM, persistence, QUIC, SDK, CLI, tile pipeline, Merkle migration, agent sessions |
 | Rust (`--features bls`) | 84 | real mainnet BLS signatures + committee rotation |
 | Solidity (Foundry) | 41 (+7 skipped) | the EVM verifier: rules, fuzzing, version pinning, cross-language encoding; the real-Groth16 suite skips pending a proof fixture |
-| TypeScript | 41 | light-client proofs for **both** Merkle versions, against Rust-generated fixtures |
+| TypeScript | 60 | light-client proofs (both Merkle versions) **and** cross-language session signing, against Rust-generated fixtures |
 
 New here? [CONTRIBUTING.md](CONTRIBUTING.md) covers setup and the crate-boundary
 rules; [SECURITY.md](SECURITY.md) is blunt about what is and isn't safe;
@@ -297,7 +441,12 @@ tables, each holding one bincode blob:
 The `restart_recovery` test kills one of four validators, keeps the survivors
 committing, restarts the dead node from disk, and asserts it re-syncs the gap
 it missed and converges to the identical store root — including a Talon VM
-write committed before the crash.
+write committed before the crash. It **waits on the actual convergence
+condition** (polling each validator's committed root) rather than sleeping a
+fixed interval and hoping; an earlier sleep-driven version flaked about one run
+in six under CPU load, reporting a "divergence" that was really the restarted
+node still catching up. `contracts/../AUDIT.md` documents the fix and the soak
+results (0/10 failures under the load that broke the old test).
 
 **Persistence limitations (bootstrap):** the full snapshot is rewritten each
 flush (no incremental deltas — fine at bootstrap DAG sizes); after an

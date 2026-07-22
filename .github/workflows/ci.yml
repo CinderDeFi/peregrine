@@ -95,6 +95,12 @@ jobs:
       - name: Regenerate proof fixture from Rust
         run: cargo run -p peregrine-node --example gen_js_fixture
 
+      # Session signing is the other place the two languages must agree
+      # byte-for-byte. Regenerating here means a change to either side shows up
+      # as a failing test rather than as signatures no validator accepts.
+      - name: Regenerate session fixture from Rust
+        run: cargo run -p peregrine-node --example gen_session_fixture
+
       - name: Verify it in TypeScript
         working-directory: sdk/js
         run: |

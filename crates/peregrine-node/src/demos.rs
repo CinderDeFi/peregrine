@@ -688,3 +688,283 @@ pub async fn watch(
 fn hex_of(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
+
+// ── agent sessions & micropayments ──────────────────────────────────────────
+
+/// An autonomous agent buys a data feed with a scoped, budgeted session key —
+/// then the principal revokes it mid-stream.
+///
+/// The point of the demo is what an agent *cannot* do. A session key is not a
+/// small key; it is a bounded one, and every bound is enforced by consensus
+/// rather than by the agent's good behaviour.
+pub async fn agent() -> Result<()> {
+    use crate::payload::WirePayload;
+    use crate::pipeline::ExecutionPipeline;
+    use peregrine_core::Keypair;
+    use peregrine_data::sessions::{
+        balances_table, sign_revocation, Action, SessionBuilder, SessionSigner,
+    };
+    use peregrine_data::streams::Publisher;
+    use peregrine_data::tables::TableId;
+
+    let mut rng = rand::rngs::OsRng;
+    let principal = Keypair::generate(&mut rng); // the human's key: never leaves cold storage
+    let agent_key = Keypair::generate(&mut rng); // the agent's throwaway key
+    let oracle = Keypair::generate(&mut rng); // sells a price feed
+    let oracle_pk = oracle.public();
+
+    let notes = TableId::named("agent.notes");
+    let mut node = ExecutionPipeline::new();
+    node.tables.create_table(notes);
+    let feed = node.streams.register("acme/BTC-USD", oracle_pk);
+    node.set_round_for_test(1);
+
+    println!("\n── act 1 · a bounded delegation ──────────────────────────");
+
+    // Everything starts closed; each capability is opened deliberately.
+    let grant = SessionBuilder::new(100) // expires at round 100 — a round, not a clock
+        .allow_table(notes)
+        .allow_stream(feed)
+        .budget(50) // total the agent may ever spend
+        .max_per_action(5) // and never more than this at once
+        .sign(&principal, &agent_key.public());
+    let session_id = grant.grant.id();
+
+    node.apply_payload(&WirePayload::OpenSession(Box::new(grant)));
+    println!("  session {}          opened", session_id.short());
+    println!("  budget 50 grains · max 5/action · expires round 100");
+    println!("  may write : agent.notes");
+    println!("  may buy   : acme/BTC-USD");
+
+    let mut signer = SessionSigner::new(agent_key, session_id);
+
+    println!("\n── act 2 · what the agent cannot do ──────────────────────");
+
+    // Out of scope.
+    node.apply_payload(&WirePayload::SessionAction(Box::new(signer.sign(
+        Action::Write {
+            table: TableId::named("treasury.reserve"),
+            key: b"drain".to_vec(),
+            value: b"everything".to_vec(),
+        },
+    ))));
+    signer.rollback(); // refused, so the chain still expects that nonce
+    println!(
+        "  write to treasury.reserve … {}",
+        ok(node
+            .tables
+            .get(&TableId::named("treasury.reserve"), b"drain")
+            .is_none())
+    );
+
+    // Over the per-action cap.
+    node.apply_payload(&WirePayload::SessionAction(Box::new(signer.sign(
+        Action::Pay {
+            payee: oracle_pk,
+            amount: 40,
+        },
+    ))));
+    signer.rollback();
+    let bal = |n: &ExecutionPipeline| -> u64 {
+        n.tables
+            .get(&balances_table(), &oracle_pk.0)
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    };
+    println!("  pay 40 (cap is 5)         … {}", ok(bal(&node) == 0));
+
+    println!("\n── act 3 · streaming micropayments ───────────────────────");
+
+    // One signature buys an ongoing subscription. After this, payment happens
+    // on the fast path — one debit per committed record, no more signatures.
+    node.apply_payload(&WirePayload::SessionAction(Box::new(signer.sign(
+        Action::Subscribe {
+            stream: feed,
+            price_per_record: 2,
+        },
+    ))));
+    println!("  subscribed to acme/BTC-USD at 2 grains/record");
+
+    let mut publisher = Publisher::new("acme/BTC-USD", oracle);
+    for i in 0..8u64 {
+        let price = 6_150_000u64 + i * 25;
+        node.apply_payload(&WirePayload::Shred(
+            publisher.emit(price.to_le_bytes().to_vec()),
+        ));
+    }
+
+    let spent = node.sessions[&session_id].spent;
+    println!(
+        "  8 records committed       → agent spent {spent} grains, oracle earned {}",
+        bal(&node)
+    );
+    println!("  budget remaining          : {}", 50 - spent);
+
+    println!("\n── act 4 · the budget is a hard ceiling ──────────────────");
+    for i in 0..40u64 {
+        node.apply_payload(&WirePayload::Shred(
+            publisher.emit((6_160_000u64 + i).to_le_bytes().to_vec()),
+        ));
+    }
+    let spent = node.sessions[&session_id].spent;
+    println!("  40 more records committed … the stream keeps flowing");
+    println!(
+        "  agent spent               : {spent} of 50 — never more  {}",
+        ok(spent <= 50)
+    );
+    println!("  (an agent out of budget stops paying; the chain does not stop)");
+
+    println!("\n── act 5 · revocation ────────────────────────────────────");
+    let before = node.sessions[&session_id].spent;
+    let sig = sign_revocation(&principal, &session_id);
+    node.revoke_session(&session_id, &sig);
+    for _ in 0..5 {
+        node.apply_payload(&WirePayload::Shred(publisher.emit(vec![0u8; 8])));
+    }
+    println!(
+        "  principal revoked         … meter stopped {}",
+        ok(node.sessions[&session_id].spent == before)
+    );
+
+    println!(
+        "\nThe agent held a key the whole time. It could never spend past 50,\n\
+         never pay more than 5 at once, never touch a table outside its scope,\n\
+         and stopped the instant its principal said so — all enforced by\n\
+         consensus, not by the agent behaving itself.\n"
+    );
+    Ok(())
+}
+
+/// RWA contract templates: title, valuation, and a collateral check against a
+/// **proven** Ethereum balance.
+///
+/// The whole demo turns on one moment — act 3, where the collateral has not
+/// been proven and the transaction traps rather than reading zero.
+pub async fn rwa_templates() -> Result<()> {
+    use crate::payload::WirePayload;
+    use crate::pipeline::{eth_state_key, eth_state_table, ExecutionPipeline};
+    use crate::templates::{
+        collateral_health, health_table, record_valuation, register_title, registry_table,
+        reserve_backed_token, title_table,
+    };
+
+    const CHAIN: u64 = 1;
+    const USDC: [u8; 20] = [
+        0xa0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1, 0x9d, 0x4a, 0x2e, 0x9e, 0xb0,
+        0xce, 0x36, 0x06, 0xeb, 0x48,
+    ];
+    const PROPERTY: &[u8] = b"PROP-1729-BRIXTON";
+    let slot = {
+        let mut s = [0u8; 32];
+        s[31] = 9;
+        s
+    };
+
+    let mut node = ExecutionPipeline::new();
+    for t in [title_table(), registry_table(), health_table()] {
+        node.tables.create_table(t);
+    }
+    let run = |node: &mut ExecutionPipeline, p: Vec<peregrine_vm::Instr>| {
+        node.apply_payload(&WirePayload::TalonTx { program: p });
+    };
+    let health = |node: &ExecutionPipeline| -> Option<u64> {
+        node.tables.get(&health_table(), PROPERTY).map(|v| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&v[..8]);
+            u64::from_le_bytes(b)
+        })
+    };
+
+    println!("\n── act 1 · title & valuation ─────────────────────────────");
+    run(&mut node, register_title(PROPERTY, 1729));
+    run(&mut node, record_valuation(PROPERTY, 500_000));
+    println!("  registered   : rwa.titles[PROP-1729-BRIXTON] = owner 1729");
+    println!("  valued       : $500,000 (signed oracle)");
+    println!("  required @30%: $150,000");
+
+    println!("\n── act 2 · the check that must NOT default to zero ───────");
+    run(
+        &mut node,
+        collateral_health(PROPERTY, 30, CHAIN, USDC, slot),
+    );
+    println!(
+        "  verdict with UNPROVEN collateral … {}",
+        ok(health(&node).is_none())
+    );
+    println!("     (the tx trapped — an unproven balance is not a balance,");
+    println!("      so no verdict is written and the last one stands)");
+
+    println!("\n── act 3 · with a proven balance ─────────────────────────");
+    let prove = |node: &mut ExecutionPipeline, amount: u64| {
+        let mut word = [0u8; 32];
+        word[24..].copy_from_slice(&amount.to_be_bytes());
+        node.tables.insert(
+            eth_state_table(),
+            eth_state_key(CHAIN, &USDC, &slot),
+            word.to_vec(),
+        );
+    };
+
+    prove(&mut node, 200_000);
+    run(
+        &mut node,
+        collateral_health(PROPERTY, 30, CHAIN, USDC, slot),
+    );
+    println!(
+        "  collateral $200,000 (ample)   → {}",
+        if health(&node) == Some(1) {
+            "HEALTHY"
+        } else {
+            "UNDER"
+        }
+    );
+
+    prove(&mut node, 100_000);
+    run(
+        &mut node,
+        collateral_health(PROPERTY, 30, CHAIN, USDC, slot),
+    );
+    println!(
+        "  collateral $100,000 (short)   → {}",
+        if health(&node) == Some(1) {
+            "HEALTHY"
+        } else {
+            "UNDER-COLLATERALISED"
+        }
+    );
+
+    println!("\n── act 4 · reserve-backed token ──────────────────────────");
+    prove(&mut node, 1_000_000);
+    run(
+        &mut node,
+        reserve_backed_token(PROPERTY, 100, 5_000, CHAIN, USDC, slot),
+    );
+    println!(
+        "  100 shares x $5,000 vs $1,000,000 reserve → {}",
+        if health(&node) == Some(1) {
+            "BACKED"
+        } else {
+            "UNDER"
+        }
+    );
+    run(
+        &mut node,
+        reserve_backed_token(PROPERTY, 300, 5_000, CHAIN, USDC, slot),
+    );
+    println!(
+        "  300 shares x $5,000 vs $1,000,000 reserve → {}",
+        if health(&node) == Some(1) {
+            "BACKED"
+        } else {
+            "UNDER-RESERVED"
+        }
+    );
+
+    println!(
+        "\nEvery verdict above is a deterministic function of committed state.\n\
+         A lender audits it with the 32-byte store root and nothing else — and\n\
+         a missing oracle produces no verdict rather than a wrong one.\n"
+    );
+    Ok(())
+}

@@ -285,6 +285,19 @@ impl SyncAggregate {
 
     /// Enforce the > 2/3 threshold.
     pub fn check_participation(&self) -> Result<usize, BeaconError> {
+        // AUDIT I-2: enforce the bitvector length here, not only in the BLS
+        // verifier. Otherwise this count and the verifier's participant
+        // selection could be computed over different-length inputs — the
+        // verifier rejects a wrong length, so there was no bypass, but the
+        // participation count must not depend on that ordering. Exactly 512
+        // bits = 64 bytes.
+        if self.sync_committee_bits.len() != SYNC_COMMITTEE_SIZE / 8 {
+            return Err(BeaconError::Malformed(format!(
+                "sync committee bits are {} bytes, expected {}",
+                self.sync_committee_bits.len(),
+                SYNC_COMMITTEE_SIZE / 8
+            )));
+        }
         let got = self.participants();
         if got < MIN_SYNC_PARTICIPANTS {
             return Err(BeaconError::InsufficientParticipation {

@@ -253,9 +253,16 @@ impl SmtV2 {
     /// positions first differ at or below `depth`.
     fn split(a: Node, apos: &[u8; 32], b: Node, bpos: &[u8; 32], depth: usize) -> Node {
         if depth >= MAX_DEPTH {
-            // Two distinct keys with the same 256-bit blake3 digest. Finding
-            // this is a break of the hash, not something to paper over.
-            panic!("blake3 collision between two distinct keys");
+            // AUDIT I-3: two distinct keys with the same 256-bit blake3 digest —
+            // a preimage collision, ~2^128 work, cryptographically unreachable.
+            // The panic is *deliberately kept* over the "softer" alternatives the
+            // audit floated: a no-op or dropping one key would silently pick a
+            // winner, and *which* key wins could differ across nodes → a fork
+            // that is invisible until roots disagree. A deterministic halt is the
+            // correct response to an impossible-yet-catastrophic invariant break:
+            // if it ever fired, blake3 is broken and every root is already
+            // meaningless. Halting loudly beats diverging quietly.
+            panic!("blake3 collision between two distinct keys (hash is broken)");
         }
         let (abit, bbit) = (bit(apos, depth), bit(bpos, depth));
         if abit == bbit {

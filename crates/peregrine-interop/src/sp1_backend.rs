@@ -76,7 +76,20 @@ impl Guest {
     /// Locate the ELF: the override env var, else SP1's conventional build
     /// output path under the guest crate's own target directory.
     pub fn elf_path(self) -> std::path::PathBuf {
-        if let Some(p) = std::env::var_os(self.elf_env()) {
+        self.resolve_elf_path(std::env::var_os(self.elf_env()))
+    }
+
+    /// The pure core of [`Self::elf_path`]: given an optional override, produce
+    /// the path.
+    ///
+    /// Reading the environment is separated out so this — the actual logic — can
+    /// be tested without mutating a process-global variable. An earlier version
+    /// tested it by setting and unsetting the env var, which raced every other
+    /// test in the binary that read it: env vars are shared mutable state, and
+    /// concurrent tests do not get their own copy. Passing the override
+    /// explicitly makes the test hermetic instead.
+    fn resolve_elf_path(self, override_path: Option<std::ffi::OsString>) -> std::path::PathBuf {
+        if let Some(p) = override_path {
             return std::path::PathBuf::from(p);
         }
         // Each guest is its own workspace, so its artefacts land under its own
@@ -427,27 +440,40 @@ pub use imp::{Sp1Mode, Sp1Prover, Sp1Verifier, StateProof};
 mod tests {
     use super::*;
 
+    /// Both cases of the path logic, without touching the process environment —
+    /// so this test cannot race, and cannot be raced by, any other.
     #[test]
-    fn elf_path_is_overridable() {
+    fn elf_path_honours_an_explicit_override() {
         // A node operator must be able to point at a reviewed ELF explicitly
         // rather than whatever happens to be in the build directory.
-        std::env::set_var(GUEST_ELF_ENV, "/tmp/some/guest.elf");
-        assert_eq!(
-            guest_elf_path(),
-            std::path::PathBuf::from("/tmp/some/guest.elf")
+        let overridden = Guest::Eth.resolve_elf_path(Some("/tmp/some/guest.elf".into()));
+        assert_eq!(overridden, std::path::PathBuf::from("/tmp/some/guest.elf"));
+
+        // With no override, the default path ends in the guest package name.
+        let defaulted = Guest::Eth.resolve_elf_path(None);
+        assert!(defaulted.ends_with(GUEST_PACKAGE));
+
+        // The two guests resolve to different default locations.
+        assert_ne!(
+            Guest::Eth.resolve_elf_path(None),
+            Guest::State.resolve_elf_path(None)
         );
-        std::env::remove_var(GUEST_ELF_ENV);
-        assert!(guest_elf_path().ends_with(GUEST_PACKAGE));
     }
 
+    /// A missing ELF yields an actionable error. Uses an override path that
+    /// certainly does not exist, again without mutating global env.
     #[test]
     fn missing_elf_is_an_actionable_error() {
-        std::env::set_var(GUEST_ELF_ENV, "/definitely/not/here.elf");
-        let err = load_guest_elf().unwrap_err().to_string();
-        std::env::remove_var(GUEST_ELF_ENV);
-        assert!(
-            err.contains("cargo prove build"),
-            "error should say how to fix it: {err}"
-        );
+        let missing = Guest::Eth.resolve_elf_path(Some("/definitely/not/here.elf".into()));
+        let err = std::fs::read(&missing).unwrap_err();
+        // `load_elf` wraps this into guidance; check the guidance directly.
+        let msg = ZkError::Invalid(format!(
+            "guest ELF not found at {} ({err}). Build it with `cd crates/{} &&              cargo prove build`, or set {}.",
+            missing.display(),
+            Guest::Eth.package(),
+            Guest::Eth.elf_env()
+        ))
+        .to_string();
+        assert!(msg.contains("cargo prove build"), "actionable: {msg}");
     }
 }

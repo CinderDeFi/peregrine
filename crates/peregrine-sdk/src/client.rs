@@ -2,7 +2,8 @@
 
 use crate::protocol::{read_frame, write_frame, RpcRequest, RpcResponse};
 use crate::tls;
-use peregrine_core::Hash;
+use peregrine_core::{Hash, Keypair};
+use peregrine_data::sessions::{SignedAction, SignedGrant};
 use peregrine_data::streams::StreamShred;
 use peregrine_data::tables::{ProvenRead, TableId};
 use peregrine_interop::VerifiedClaim;
@@ -105,6 +106,41 @@ impl Client {
     pub async fn submit_claim(&self, claim: VerifiedClaim) -> Result<(), SdkError> {
         self.expect_accepted(RpcRequest::SubmitClaim(Box::new(claim)))
             .await
+    }
+
+    /// Open a session: delegate scoped, budgeted, expiring authority to a
+    /// session key. Build the grant with
+    /// [`SessionBuilder`](peregrine_data::sessions::SessionBuilder).
+    ///
+    /// As with every submission, `Ok` means "queued" — the grant is verified
+    /// during commit, on every validator.
+    pub async fn open_session(&self, grant: SignedGrant) -> Result<(), SdkError> {
+        self.expect_accepted(RpcRequest::OpenSession(Box::new(grant)))
+            .await
+    }
+
+    /// Submit an action authorised by a session key. Sign it with
+    /// [`SessionSigner`](peregrine_data::sessions::SessionSigner), which tracks
+    /// the nonce for you.
+    pub async fn session_action(&self, action: SignedAction) -> Result<(), SdkError> {
+        self.expect_accepted(RpcRequest::SessionAction(Box::new(action)))
+            .await
+    }
+
+    /// Revoke a session. Must be signed by the **principal** — a session key
+    /// cannot revoke itself, and more importantly cannot prevent its own
+    /// revocation.
+    pub async fn revoke_session(
+        &self,
+        principal: &Keypair,
+        session_id: Hash,
+    ) -> Result<(), SdkError> {
+        let signature = peregrine_data::sessions::sign_revocation(principal, &session_id);
+        self.expect_accepted(RpcRequest::RevokeSession {
+            session_id,
+            signature,
+        })
+        .await
     }
 
     /// Read `key` from `table` with an inclusion proof against the store root,

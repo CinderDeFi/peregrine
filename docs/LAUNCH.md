@@ -37,6 +37,160 @@ and the limitations are written down. Lead with that.
 
 ---
 
+## Public launch thread (repo is public + demo)
+
+> The headline "it's live, go run it" thread. Leads with the demo because the
+> demo is the argument. Same ground rules apply. Nine posts; keep 1, 2, and 9 if
+> trimming.
+
+**1/**
+Peregrine is public.
+
+A Layer-1 where every read carries a proof you check yourself — no RPC provider
+to trust, no bridge multisig, no oracle.
+
+Don't take my word for any of it. Clone it and run the ten-second demo 👇
+
+Unaudited scaffold, no token. <URL>
+
+**2/**
+```
+git clone <URL> && cd peregrine
+cargo install --path crates/peregrine-cli
+peregrine -q demo
+```
+
+That stands up a **4-validator devnet over a real QUIC mesh** and runs four acts
+end to end in ~10 seconds. Real consensus, no faucet, no config.
+
+**3/**
+What the demo shows, in order:
+
+· signed price ticks committed and materialized
+· a metered on-chain VM loop (1..=10 → 55)
+· a light client accepting a genuine proof and *rejecting* a tampered one
+· a contract that **traps** on unverified Ethereum state instead of reading zero
+
+**4/**
+The idea under it: signed high-frequency records ride *inside* consensus
+dissemination instead of queueing behind blocks.
+
+They commit to a deterministic order and materialize into Merkle-verifiable
+tables. A client holding 32 bytes verifies any read — in a browser.
+
+**5/**
+The numbers, measured on 4 validators on one laptop:
+
+· 19,993 records/s at p50 **4.19 ms**
+· ~34,000 records/s sustained ceiling
+
+Loopback, so treat latency as a floor, not a finality claim. Reproduce:
+`peregrine bench`
+
+**6/**
+Cross-chain is where money actually gets stolen, so there are no multisigs.
+
+Ethereum state is verified inside a zkVM and re-checked by *every* validator at
+commit time — a real proof verifies in the commit path in **52 ms**. The reverse
+direction is a real on-chain Groth16 verifier doing the full BN254 pairing.
+
+**7/**
+The rule I care most about: **absence is never zero.**
+
+A contract reading unverified foreign state traps. An on-chain read of an
+unproven key reverts. Missing data is an error, not a default — that confusion is
+behind a long list of real exploits.
+
+**8/**
+Checked against reality, not vibes: real mainnet block hashes, real `eth_getProof`
+responses, a real 510/512 BLS aggregate. The Rust, TypeScript, and Solidity
+verifiers are diffed byte-for-byte against the same fixtures in CI.
+
+Internal review found a real bug (a consensus check compiled out of release). Fixed, written up.
+
+**9/**
+What it is NOT: audited, deployed, or economically complete. No token, nothing
+to buy.
+
+The limitations list is longer than the pitch, and it's public.
+
+Demo + code: <URL>
+Audit package: AUDIT.md
+
+Apache-2.0. I'd rather hear what's wrong with it than what's good.
+
+---
+
+## Milestone announcement thread (feature-complete)
+
+> Use this for the "the loop is closed" moment. The general thread below is the
+> evergreen intro. Same ground rules apply — every line here is true as written;
+> do not embellish. Tweet **3/** is true as of this release:
+> `PeregrineProofE2E.t.sol` passes against a real proof (≈418k gas), so the
+> claim that the proof is verified on-chain is earned, not aspirational.
+
+**1/**
+Peregrine just closed the loop, end to end.
+
+A Layer-1 where every read carries a proof — and where *both* directions of the
+Ethereum bridge now meet real cryptography, no mock in the path.
+
+Still unaudited, still no token. What "feature-complete scaffold" means 👇
+
+**2/**
+Ethereum → Peregrine:
+
+A real SP1 proof of Ethereum state is verified *inside the commit path* — on
+every validator, in ~52 ms. Proving takes minutes and happens once, off-chain;
+verification is milliseconds and happens on-chain, every time.
+
+No multisig anywhere near it.
+
+**3/**
+Peregrine → Ethereum:
+
+The EVM light client uses SP1's **real on-chain Groth16 verifier** (vendored at
+the exact circuit version), doing the full BN254 pairing. A genuine proof of
+Peregrine state, from the real prover, is verified on-chain for **~418k gas** —
+no mock in the path. The end-to-end test is in the repo.
+
+**4/**
+The part I'm most careful about: this is the scaffold reaching
+feature-completeness, NOT a production launch.
+
+It has not been third-party audited. It has never been deployed. It holds no
+value and there is no token.
+
+The limitations list is longer than the pitch, and it's public.
+
+**5/**
+Before this milestone I ran an internal security review of the ~3,660
+consensus-critical lines.
+
+It found a real one: a consensus round-structure check that was a `debug_assert`
+— compiled out of release builds. Plus five lower-severity items.
+
+All fixed, all written up with resolutions in AUDIT.md.
+
+**6/**
+Everything is checked against reality, not vibes:
+
+· Ethereum verification tested against real mainnet data (block hashes,
+  eth_getProof, a real 510/512 BLS aggregate)
+· the TypeScript + Solidity verifiers checked byte-for-byte against
+  Rust-generated fixtures in CI
+
+**7/**
+What's next is unglamorous and specific: a third-party audit, committee rotation
+so the EVM client can follow a live validator set, and coverage-guided fuzzing
+of the Merkle tree and the committer.
+
+Code, AUDIT.md, and the honest-limitations list: <URL>
+
+Apache-2.0. I'd rather hear what's wrong with it than what's good.
+
+---
+
 ## X / Twitter thread
 
 > Replace `<URL>` with the repo link. Nine posts; trim from the middle if you
@@ -176,7 +330,7 @@ Some things that might interest this crowd:
   block hashes, real `eth_getProof` responses, a real 510/512 BLS aggregate.
 
 It is an unaudited scaffold: never deployed, holds no value, no token. There's
-an AUDIT.md with the scope, sixteen named invariants, a threat model, and a
+an AUDIT.md with the scope, nineteen named invariants, a threat model, and a
 ranked list of what I'd attack first. The known-limitations section is longer
 than the pitch.
 
