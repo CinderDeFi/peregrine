@@ -2,8 +2,12 @@
 
 use crate::protocol::{read_frame, write_frame, RpcRequest, RpcResponse};
 use crate::tls;
-use peregrine_core::{Hash, Keypair};
-use peregrine_data::sessions::{SignedAction, SignedGrant};
+use peregrine_core::{Hash, Keypair, PublicKey};
+use peregrine_data::compliance::SignedAttestation;
+use peregrine_data::faucet::SignedDrip;
+use peregrine_data::feeds::{feed_latest_table, FeedId, FeedSpec, FeedValue};
+use peregrine_data::sessions::balances_table;
+use peregrine_data::sessions::{sessions_table, SessionState, SignedAction, SignedGrant};
 use peregrine_data::streams::StreamShred;
 use peregrine_data::tables::{ProvenRead, TableId};
 use peregrine_interop::VerifiedClaim;
@@ -108,6 +112,48 @@ impl Client {
             .await
     }
 
+    /// Submit a KYC/AML attestation about an account, signed by an attester.
+    ///
+    /// As with every submission, `Ok` means "queued" — the attester's signature
+    /// is verified during commit, on every validator, before the compact flag is
+    /// materialized into `sys.compliance`. Read it back with
+    /// [`prove_read`](Self::prove_read) against
+    /// [`compliance_table`](peregrine_data::compliance::compliance_table).
+    pub async fn submit_attestation(&self, signed: SignedAttestation) -> Result<(), SdkError> {
+        self.expect_accepted(RpcRequest::SubmitAttestation(Box::new(signed)))
+            .await
+    }
+
+    /// Register an oracle feed so its providers' observations are aggregated
+    /// into `sys.feed_latest`. Permissionless and idempotent — the feed id is
+    /// the hash of the spec. Returns the feed id.
+    pub async fn register_feed(&self, spec: FeedSpec) -> Result<FeedId, SdkError> {
+        let id = spec.id();
+        self.expect_accepted(RpcRequest::RegisterFeed(Box::new(spec)))
+            .await?;
+        Ok(id)
+    }
+
+    /// Read a feed's aggregated latest value **with a proof**, verify it against
+    /// the store root, and decode it. Returns `None` if the feed has no value
+    /// yet. This is the trustless read path: only the 32-byte root is trusted.
+    ///
+    /// Pass a `root` you already trust to avoid taking the node's word for it;
+    /// otherwise the node's current root is fetched and used.
+    pub async fn read_feed(&self, feed_id: FeedId) -> Result<Option<FeedValue>, SdkError> {
+        let read = match self.prove_read(feed_latest_table(), &feed_id.0 .0).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let root = self.store_root().await?;
+        if !read.verify(&root) {
+            return Err(SdkError::Node("feed proof failed to verify".into()));
+        }
+        FeedValue::decode(&read.value)
+            .map(Some)
+            .ok_or_else(|| SdkError::Codec("malformed feed value".into()))
+    }
+
     /// Open a session: delegate scoped, budgeted, expiring authority to a
     /// session key. Build the grant with
     /// [`SessionBuilder`](peregrine_data::sessions::SessionBuilder).
@@ -143,6 +189,26 @@ impl Client {
         .await
     }
 
+    /// Read a session's committed state **with a proof** — its remaining budget,
+    /// next nonce, subscriptions, and whether it is still live — verified against
+    /// the store root. `None` if the session is unknown.
+    ///
+    /// This is how an agent checks its own limits without trusting the node:
+    /// what it can spend is proven, not reported.
+    pub async fn read_session(&self, session_id: Hash) -> Result<Option<SessionState>, SdkError> {
+        let read = match self.prove_read(sessions_table(), &session_id.0).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let root = self.store_root().await?;
+        if !read.verify(&root) {
+            return Err(SdkError::Node("session proof failed to verify".into()));
+        }
+        SessionState::from_bytes(&read.value)
+            .map(Some)
+            .ok_or_else(|| SdkError::Codec("malformed session state".into()))
+    }
+
     /// Read `key` from `table` with an inclusion proof against the store root,
     /// or `None` if absent. Verify the returned proof with
     /// [`ProvenRead::verify`] against [`store_root`](Self::store_root).
@@ -162,6 +228,34 @@ impl Client {
             RpcResponse::Error(e) => Err(SdkError::Node(e)),
             _ => Err(SdkError::Unexpected),
         }
+    }
+
+    /// Submit a signed faucet drip (as the faucet operator). `Ok` means queued;
+    /// the authority signature and the per-recipient limits are enforced during
+    /// commit, so a queued drip may still be refused there — read the recipient's
+    /// balance with [`balance_of`](Self::balance_of) to confirm.
+    pub async fn submit_drip(&self, signed: SignedDrip) -> Result<(), SdkError> {
+        self.expect_accepted(RpcRequest::FaucetDrip(Box::new(signed)))
+            .await
+    }
+
+    /// The grain balance of `account` in `sys.balances`, **verified** against the
+    /// store root. `0` if the account has never been credited.
+    pub async fn balance_of(&self, account: &PublicKey) -> Result<u64, SdkError> {
+        let read = match self.prove_read(balances_table(), &account.0).await? {
+            Some(r) => r,
+            None => return Ok(0),
+        };
+        let root = self.store_root().await?;
+        if !read.verify(&root) {
+            return Err(SdkError::Node("balance proof failed to verify".into()));
+        }
+        let bytes: [u8; 8] = read
+            .value
+            .as_slice()
+            .try_into()
+            .map_err(|_| SdkError::Codec("malformed balance".into()))?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     /// The node's current 32-byte store root (what a light client pins).

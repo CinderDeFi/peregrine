@@ -18,7 +18,7 @@ production software. Nothing in this repository should hold value.
 | Test suite stability under load | ✅ four flaky tests fixed (three timing, one env-var race); full suite 0/10 under load (see [`AUDIT.md`](AUDIT.md#determinism-of-the-suite-itself)) |
 
 **[`AUDIT.md`](AUDIT.md) is the entry point for reviewers**: scope, trust
-boundaries, nineteen named invariants, a threat model, a full test-coverage
+boundaries, twenty-three named invariants, a threat model, a full test-coverage
 map, and a ranked list of what to attack first. It exists to make an audit efficient, not to suggest one has
 happened.
 

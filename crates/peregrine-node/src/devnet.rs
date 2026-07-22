@@ -99,9 +99,46 @@ impl Devnet {
         .await
     }
 
-    /// Start a devnet from explicit options.
+    /// Start a devnet from explicit options, with freshly-generated validator
+    /// keys and no chain id / faucet.
     pub async fn launch(opts: DevnetOptions) -> anyhow::Result<Self> {
-        if opts.validators < 2 {
+        Self::launch_inner(opts, None).await
+    }
+
+    /// Start a devnet **from genesis**: the committee, chain id, faucet policy,
+    /// and initial allocations all come from the [`GenesisRuntime`], and the
+    /// validator count is genesis's. Used by `peregrine node run --genesis`.
+    pub async fn launch_from_genesis(
+        opts: DevnetOptions,
+        genesis: crate::genesis::GenesisRuntime,
+    ) -> anyhow::Result<Self> {
+        Self::launch_inner(opts, Some(genesis)).await
+    }
+
+    async fn launch_inner(
+        opts: DevnetOptions,
+        genesis: Option<crate::genesis::GenesisRuntime>,
+    ) -> anyhow::Result<Self> {
+        // Resolve the validator keys + stakes from genesis, else generate them.
+        let (keypairs, stakes): (Vec<Keypair>, Vec<u64>) = match &genesis {
+            Some(g) => (
+                g.validators
+                    .iter()
+                    .map(|(kp, _)| Keypair::from_bytes(&kp.to_bytes()))
+                    .collect(),
+                g.validators.iter().map(|(_, s)| *s).collect(),
+            ),
+            None => {
+                let mut rng = rand::rngs::OsRng;
+                let kps: Vec<Keypair> = (0..opts.validators)
+                    .map(|_| Keypair::generate(&mut rng))
+                    .collect();
+                let stakes = vec![100u64; kps.len()];
+                (kps, stakes)
+            }
+        };
+        let n_validators = keypairs.len() as u16;
+        if n_validators < 2 {
             anyhow::bail!(
                 "a devnet needs at least 2 validators: a lone validator's own proposal \
                  self-delivers instantly, so it re-proposes in a hot loop with no network \
@@ -115,22 +152,20 @@ impl Devnet {
         let rpc_bind = opts.rpc_addr;
         let mut rng = rand::rngs::OsRng;
 
-        let keypairs: Vec<Keypair> = (0..opts.validators)
-            .map(|_| Keypair::generate(&mut rng))
-            .collect();
         let committee = Committee::new(
             keypairs
                 .iter()
+                .zip(&stakes)
                 .enumerate()
-                .map(|(i, kp)| ValidatorInfo {
+                .map(|(i, (kp, stake))| ValidatorInfo {
                     id: ValidatorId(i as u16),
                     public_key: kp.public(),
-                    stake: 100,
+                    stake: *stake,
                 })
                 .collect(),
         );
 
-        let mut cluster = quic_cluster(opts.validators).await?;
+        let mut cluster = quic_cluster(n_validators).await?;
 
         // Pre-register the demo publisher so client-published records validate
         // on every validator (this is genesis config in a real deployment).
@@ -152,6 +187,17 @@ impl Devnet {
             let net = node.broadcaster();
             let mut pipeline = ExecutionPipeline::new().with_tiles(Arc::clone(&tiles));
             pipeline.streams.register(&opts.stream, publisher_pk);
+
+            // Genesis state, applied identically on every validator so their
+            // store roots agree from the first round: chain id, faucet policy,
+            // and initial balance allocations.
+            if let Some(g) = &genesis {
+                pipeline.chain_id = g.chain_id;
+                pipeline.faucet = g.faucet;
+                for (account, grains) in &g.allocations {
+                    pipeline.allocate(account, *grains);
+                }
+            }
 
             // Each validator gets its own redb file when persistence is on, so
             // a restart reloads that node's own committed state.

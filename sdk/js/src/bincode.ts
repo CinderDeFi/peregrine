@@ -102,3 +102,79 @@ export function encode(write: (w: BincodeWriter) => void): Bytes {
   write(w);
   return w.finish();
 }
+
+/**
+ * The mirror of {@link BincodeWriter}: reads Rust's bincode back. Used to decode
+ * committed `SessionState` so an agent can read its own remaining budget. Same
+ * encoding rules as the writer; throws if it runs off the end of the buffer.
+ */
+export class BincodeReader {
+  #view: DataView;
+  #bytes: Bytes;
+  #off = 0;
+
+  constructor(bytes: Bytes) {
+    this.#bytes = bytes;
+    this.#view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+
+  #need(n: number): void {
+    if (this.#off + n > this.#bytes.length) throw new Error("bincode: unexpected end of input");
+  }
+
+  /** `n` raw bytes (a `[u8; N]` field). */
+  fixedBytes(n: number): Bytes {
+    this.#need(n);
+    const out = this.#bytes.subarray(this.#off, this.#off + n);
+    this.#off += n;
+    return out;
+  }
+
+  hash32(): Bytes {
+    return this.fixedBytes(32);
+  }
+
+  u32(): number {
+    this.#need(4);
+    const v = this.#view.getUint32(this.#off, true);
+    this.#off += 4;
+    return v;
+  }
+
+  u64(): bigint {
+    this.#need(8);
+    const v = this.#view.getBigUint64(this.#off, true);
+    this.#off += 8;
+    return v;
+  }
+
+  bool(): boolean {
+    this.#need(1);
+    const b = this.#view.getUint8(this.#off);
+    this.#off += 1;
+    return b !== 0;
+  }
+
+  /** A `Vec<T>`: `u64` length, then each element via `read`. */
+  vec<T>(read: (r: BincodeReader) => T): T[] {
+    const n = Number(this.u64());
+    const out: T[] = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = read(this);
+    return out;
+  }
+
+  /** A `Vec<u8>`. */
+  byteVec(): Bytes {
+    return this.fixedBytes(Number(this.u64()));
+  }
+
+  /** An enum variant tag (`u32`). */
+  variant(): number {
+    return this.u32();
+  }
+
+  /** Bytes left unread — should be 0 after decoding a whole value. */
+  remaining(): number {
+    return this.#bytes.length - this.#off;
+  }
+}

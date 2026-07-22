@@ -17,6 +17,14 @@ use crate::payload::WirePayload;
 use crate::tiles::TilePool;
 use peregrine_consensus::{CommitObserver, Dag};
 use peregrine_core::{Hash, Round};
+use peregrine_data::compliance::{
+    cell_key, compliance_table, CompliancePolicy, ComplianceError, SignedAttestation,
+};
+use peregrine_data::faucet::{faucet_table, DripRecord, FaucetPolicy, SignedDrip};
+use peregrine_data::feeds::{
+    aggregate, decode_source, encode_source, feed_latest_table, feed_source_table, feeds_table,
+    source_key, FeedId, FeedObservation, FeedRegistry, FeedSpec, FeedValue,
+};
 use peregrine_data::fees::{DualMeter, FeeSchedule, FeeSplit};
 use peregrine_data::sessions::{
     self as sessions, balances_table, sessions_table, Action, Grains, SessionState, SignedAction,
@@ -113,6 +121,20 @@ pub struct PipelineMetrics {
     pub foreign_claims_applied: u64,
     /// Foreign-chain claims refused (bad proof, wrong chain, or policy).
     pub foreign_claims_rejected: u64,
+    /// Compliance attestations whose signature verified and were materialized.
+    pub attestations_applied: u64,
+    /// Compliance attestations refused (bad attester signature).
+    pub attestations_rejected: u64,
+    /// Oracle feeds registered.
+    pub feeds_registered: u64,
+    /// Feed values recomputed and written to `sys.feed_latest`.
+    pub feed_updates: u64,
+    /// Committed feed-stream records whose payload was not a valid observation.
+    pub feed_observations_rejected: u64,
+    /// Faucet drips that passed policy and credited a recipient.
+    pub faucet_drips_applied: u64,
+    /// Faucet drips refused (bad signature, over a cap, or on cooldown).
+    pub faucet_drips_rejected: u64,
 }
 
 impl PipelineMetrics {
@@ -270,6 +292,17 @@ pub struct ExecutionPipeline {
     /// would materialize rows in an order that varies per process, and two
     /// validators would compute different store roots.
     pub sessions: BTreeMap<Hash, SessionState>,
+    /// Registered oracle feeds: their specs and the stream → (feed, provider)
+    /// index. Built from committed `RegisterFeed` payloads, so it is identical
+    /// on every validator; the values themselves live in tables.
+    pub feeds: FeedRegistry,
+    /// The network's chain id, from genesis. Committed checkpoints carry it so a
+    /// proof of this chain's state can't be replayed as another's.
+    pub chain_id: u64,
+    /// The testnet faucet policy, from genesis. `None` = no faucet, and every
+    /// drip is refused (fail-closed). The per-recipient limits it carries are
+    /// enforced during commit, so they hold on every validator.
+    pub faucet: Option<FaucetPolicy>,
     /// The round currently being committed. Session expiry is measured against
     /// this, never against wall-clock time — see [`peregrine_data::sessions`].
     current_round: Round,
@@ -301,6 +334,9 @@ impl ExecutionPipeline {
             claims_this_commit: 0,
             merkle_v2_activation: None,
             sessions: BTreeMap::new(),
+            feeds: FeedRegistry::default(),
+            chain_id: 0,
+            faucet: None,
             current_round: 0,
             tiles: None,
         }
@@ -568,6 +604,176 @@ impl ExecutionPipeline {
             .insert(balances_table(), who.0.to_vec(), now.to_le_bytes().to_vec());
     }
 
+    // ── compliance ──────────────────────────────────────────────────────────
+
+    /// Materialize a signed attestation into `sys.compliance`.
+    ///
+    /// The attester's signature is verified here, on every validator, before the
+    /// compact flag is written — the chain records a *signed* statement, it does
+    /// not decide which attesters are legitimate. Idempotent: re-applying the
+    /// same attestation rewrites the same cell. Returns `Ok(true)` when the flag
+    /// was written, `Err` when the signature did not verify.
+    pub fn apply_attestation(&mut self, signed: &SignedAttestation) -> Result<bool, String> {
+        if !signed.verify() {
+            return Err("attestation signature does not verify".into());
+        }
+        let att = &signed.attestation;
+        self.tables.insert(
+            compliance_table(),
+            cell_key(&att.subject, &att.attester),
+            att.flag_bytes(),
+        );
+        Ok(true)
+    }
+
+    /// The committed compliance flag for `subject` under `attester`, if present.
+    pub fn compliance_flag(
+        &self,
+        subject: &peregrine_core::PublicKey,
+        attester: &peregrine_core::PublicKey,
+    ) -> Option<Vec<u8>> {
+        self.tables
+            .get(&compliance_table(), &cell_key(subject, attester))
+            .map(|v| v.to_vec())
+    }
+
+    /// **A compliance-gated transfer.** Credit `subject` only if it holds a
+    /// valid, unexpired `Verified` attestation from the policy's attester in
+    /// committed state; otherwise change nothing and report why. Evaluated at the
+    /// current committed round, so every validator reaches the same verdict — the
+    /// "institution requires a compliance flag before accepting a transfer" rule,
+    /// enforced on-chain rather than trusted to a relayer.
+    pub fn compliant_credit(
+        &mut self,
+        subject: &peregrine_core::PublicKey,
+        amount: Grains,
+        policy: &CompliancePolicy,
+    ) -> Result<(), ComplianceError> {
+        let flag = self.compliance_flag(subject, &policy.attester);
+        policy.require_compliant(flag.as_deref(), self.current_round)?;
+        self.credit(subject, amount);
+        Ok(())
+    }
+
+    // ── testnet faucet ───────────────────────────────────────────────────────
+
+    /// Credit an account at genesis. A funding primitive distinct from the
+    /// faucet — used once, when a genesis file lists an initial allocation.
+    pub fn allocate(&mut self, account: &peregrine_core::PublicKey, grains: Grains) {
+        self.credit(account, grains);
+    }
+
+    /// The committed faucet record for `recipient`, if any.
+    pub fn faucet_record(&self, recipient: &peregrine_core::PublicKey) -> Option<DripRecord> {
+        self.tables
+            .get(&faucet_table(), &recipient.0)
+            .and_then(DripRecord::decode)
+    }
+
+    /// Apply a signed faucet drip. Fails closed when no faucet is configured;
+    /// otherwise verifies the authority's signature and enforces the per-request,
+    /// cooldown, and lifetime limits from committed state — all on every
+    /// validator, so a permissive node cannot wave a drip through. On success
+    /// credits `sys.balances` and updates `sys.faucet[recipient]`.
+    pub fn apply_faucet_drip(
+        &mut self,
+        signed: &SignedDrip,
+    ) -> Result<(), peregrine_data::faucet::FaucetError> {
+        use peregrine_data::faucet::FaucetError;
+        let policy = self.faucet.ok_or(FaucetError::NotConfigured)?;
+        if !signed.verify(&policy.authority) {
+            return Err(FaucetError::BadSignature);
+        }
+        let recipient = signed.drip.recipient;
+        let prior = self.faucet_record(&recipient);
+        let record = policy.authorize(&signed.drip, prior, self.current_round)?;
+        self.credit(&recipient, signed.drip.amount);
+        self.tables
+            .insert(faucet_table(), recipient.0.to_vec(), record.encode());
+        Ok(())
+    }
+
+    // ── oracle feeds ─────────────────────────────────────────────────────────
+
+    /// Register an oracle feed. Indexes each provider's stream so its
+    /// observations materialize, and writes a compact spec summary to
+    /// `sys.feeds`. Idempotent — a feed is content-addressed, so re-registering
+    /// the same spec is a no-op.
+    pub fn register_feed(&mut self, spec: FeedSpec) -> FeedId {
+        let id = spec.id();
+        if self.feeds.contains(&id) {
+            return id;
+        }
+        // Register each provider's stream so the pipeline accepts their signed
+        // records. Only the named provider can actually sign them.
+        for p in &spec.providers {
+            self.streams.register(&spec.channel, *p);
+        }
+        self.tables
+            .insert(feeds_table(), id.0 .0.to_vec(), spec.summary_bytes());
+        self.feeds.insert(spec);
+        self.metrics.feeds_registered += 1;
+        id
+    }
+
+    /// A committed observation from `provider` on `feed_id`. Writes the
+    /// provider's latest into a per-source cell, then re-aggregates the **fresh**
+    /// sources into `sys.feed_latest[feed_id]`. Stale sources — those that have
+    /// not updated within the spec's staleness bound — are dropped, so a source
+    /// that goes dark stops contributing to the median.
+    fn materialize_feed_observation(
+        &mut self,
+        feed_id: FeedId,
+        provider: peregrine_core::PublicKey,
+        payload: &[u8],
+    ) {
+        // Clone the spec so the borrow of `self.feeds` ends before we touch
+        // `self.tables`; a spec is small (a few keys and a channel name).
+        let spec = match self.feeds.spec(&feed_id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let Some(obs) = FeedObservation::decode(payload) else {
+            self.metrics.feed_observations_rejected += 1;
+            return;
+        };
+        let round = self.current_round;
+
+        // The provider's latest, stamped with the committed round.
+        self.tables.insert(
+            feed_source_table(),
+            source_key(&feed_id, &provider),
+            encode_source(obs.value, round),
+        );
+
+        // Collect the fresh sources' values, in the spec's (deterministic)
+        // provider order.
+        let mut fresh = Vec::with_capacity(spec.providers.len());
+        for p in &spec.providers {
+            if let Some(cell) = self.tables.get(&feed_source_table(), &source_key(&feed_id, p)) {
+                if let Some((value, r)) = decode_source(cell) {
+                    if round.saturating_sub(r) <= spec.max_staleness_rounds {
+                        fresh.push(value);
+                    }
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return; // every source stale; leave the last good value in place
+        }
+        let fv = FeedValue {
+            value: aggregate(&fresh, spec.aggregation),
+            decimals: spec.decimals,
+            kind: spec.kind,
+            aggregation: spec.aggregation,
+            n_sources: fresh.len().min(u8::MAX as usize) as u8,
+            updated_round: round,
+        };
+        self.tables
+            .insert(feed_latest_table(), feed_id.0 .0.to_vec(), fv.encode());
+        self.metrics.feed_updates += 1;
+    }
+
     /// Open a session. The grant must be signed by the principal it names.
     pub fn open_session(&mut self, signed: &SignedGrant) -> Result<Hash, sessions::SessionError> {
         if !signed.verify() {
@@ -715,6 +921,15 @@ impl ExecutionPipeline {
                 self.tables
                     .insert(ticks_table(), key, shred.record.payload.clone());
 
+                // If this stream belongs to a registered feed, materialize the
+                // observation: update the provider's source cell and re-aggregate
+                // the fresh sources into the feed's latest value.
+                if let Some((feed_id, provider)) =
+                    self.feeds.feed_for_stream(&shred.record.stream)
+                {
+                    self.materialize_feed_observation(feed_id, provider, &shred.record.payload);
+                }
+
                 // Micropayments ride the same committed record: every session
                 // subscribed to this stream pays its per-record price, and the
                 // publisher is credited the total. Runs after the shred is
@@ -828,6 +1043,38 @@ impl ExecutionPipeline {
                 match res.trap {
                     None => self.metrics.committed_txs += 1,
                     Some(e) => tracing::warn!("tx trapped (metered): {e}"),
+                }
+            }
+            WirePayload::Attestation(signed) => {
+                // The attester's signature is verified on every validator before
+                // the flag is materialized; metered on both meters like a claim,
+                // so unpriced signature checking cannot be a DoS vector.
+                meter.tick_data(bincode::serialized_size(&signed).unwrap_or(0));
+                meter.tick_compute(CU_VERIFY_CLAIM);
+                match self.apply_attestation(&signed) {
+                    Ok(_) => self.metrics.attestations_applied += 1,
+                    Err(e) => {
+                        self.metrics.attestations_rejected += 1;
+                        tracing::warn!("attestation rejected: {e}");
+                    }
+                }
+            }
+            WirePayload::RegisterFeed(spec) => {
+                meter.tick_data(bincode::serialized_size(&spec).unwrap_or(0));
+                let id = self.register_feed(*spec);
+                tracing::debug!(feed = ?id, "feed registered");
+            }
+            WirePayload::FaucetDrip(signed) => {
+                // One signature to verify plus a couple of table reads, like any
+                // signed submission; metered so it cannot be a free DoS.
+                meter.tick_data(bincode::serialized_size(&signed).unwrap_or(0));
+                meter.tick_compute(CU_VERIFY_CLAIM);
+                match self.apply_faucet_drip(&signed) {
+                    Ok(()) => self.metrics.faucet_drips_applied += 1,
+                    Err(e) => {
+                        self.metrics.faucet_drips_rejected += 1;
+                        tracing::debug!("faucet drip refused: {e}");
+                    }
                 }
             }
         }

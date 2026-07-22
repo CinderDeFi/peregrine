@@ -36,8 +36,8 @@
  */
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { blake3 } from "@noble/hashes/blake3";
-import { encode, BincodeWriter } from "./bincode.ts";
-import { concat, fromHex, type Bytes } from "./hash.ts";
+import { encode, BincodeReader, BincodeWriter } from "./bincode.ts";
+import { bytesEqual, concat, fromHex, type Bytes } from "./hash.ts";
 
 const enc = new TextEncoder();
 
@@ -230,6 +230,12 @@ export class SessionBuilder {
     return this;
   }
 
+  /** Allow several streams at once — e.g. every source of a feed. */
+  allowStreams(streams: readonly Id32[]): this {
+    for (const s of streams) this.#scope.streams.push(s);
+    return this;
+  }
+
   /** Total spend across the session's whole life. */
   budget(grains: bigint | number): this {
     this.#budget = BigInt(grains);
@@ -260,12 +266,32 @@ export class SessionBuilder {
     };
   }
 
+  /**
+   * Validate the grant. Throws for a funded session that could never spend — a
+   * budget with no per-action cap — mirroring Rust's `SessionGrant::validate`.
+   * A scope-only session with no budget is valid.
+   */
+  validate(): void {
+    if (this.#budget > 0n && this.#scope.maxSpendPerAction === 0n) {
+      throw new Error(
+        `grant has a ${this.#budget}-grain budget but a per-action cap of 0 — it could never spend a grain; call maxPerAction()`,
+      );
+    }
+  }
+
   /** Build and sign, deriving the principal's public key from its secret. */
   sign(principalSecret: Bytes, sessionKey: Bytes): SignedGrant {
     return signGrant(
       principalSecret,
       this.build(publicKeyOf(principalSecret), sessionKey),
     );
+  }
+
+  /** {@link validate} then {@link sign} — preferred, so a misconfigured session
+   *  is caught before submission rather than at spend time. */
+  trySign(principalSecret: Bytes, sessionKey: Bytes): SignedGrant {
+    this.validate();
+    return this.sign(principalSecret, sessionKey);
   }
 }
 
@@ -304,6 +330,29 @@ export class SessionSigner {
     return signed;
   }
 
+  // Ergonomic action builders — one call each, so an agent never hand-assembles
+  // an action or forgets a field. All go through `sign`'s nonce discipline.
+
+  /** Pay `amount` grains to `payee`. */
+  pay(payee: Bytes, amount: bigint | number): SignedAction {
+    return this.sign({ kind: "pay", payee, amount: BigInt(amount) });
+  }
+
+  /** Subscribe to `stream`, paying `pricePerRecord` per committed record. */
+  subscribe(stream: Id32, pricePerRecord: bigint | number): SignedAction {
+    return this.sign({ kind: "subscribe", stream, pricePerRecord: BigInt(pricePerRecord) });
+  }
+
+  /** Stop paying for `stream`. */
+  unsubscribe(stream: Id32): SignedAction {
+    return this.sign({ kind: "unsubscribe", stream });
+  }
+
+  /** Write `value` at `key` in `table` (must be in scope). */
+  write(table: Id32, key: Bytes, value: Bytes): SignedAction {
+    return this.sign({ kind: "write", table, key, value });
+  }
+
   /**
    * Rewind after a rejected submission, so the next attempt reuses the nonce
    * the chain is still expecting. Without this, one refused action would
@@ -319,4 +368,68 @@ export function id32FromHex(hex: string): Id32 {
   const b = fromHex(hex);
   if (b.length !== 32) throw new Error(`expected 32 bytes, got ${b.length}`);
   return b;
+}
+
+// ── reading committed session state ──────────────────────────────────────────
+
+/** A stream this session is paying for. */
+export interface Subscription {
+  stream: Id32;
+  pricePerRecord: bigint;
+}
+
+/** The committed state of a session, as materialized in `sys.sessions`. */
+export interface SessionState {
+  grant: SessionGrant;
+  spent: bigint;
+  nextNonce: bigint;
+  revoked: boolean;
+  subscriptions: Subscription[];
+}
+
+/**
+ * Decode committed session state (the value of a proven read of
+ * `sys.sessions[id]`), so an agent can **prove** its own remaining budget,
+ * subscriptions, and liveness rather than trust the node. Mirrors Rust's
+ * `SessionState`; returns `null` if the bytes are not a session state.
+ */
+export function decodeSessionState(bytes: Bytes): SessionState | null {
+  try {
+    const r = new BincodeReader(bytes);
+    const grant: SessionGrant = {
+      principal: r.hash32(),
+      sessionKey: r.hash32(),
+      scope: {
+        tables: r.vec((rr) => rr.hash32()),
+        streams: r.vec((rr) => rr.hash32()),
+        maxSpendPerAction: r.u64(),
+      },
+      budgetGrains: r.u64(),
+      expiresAtRound: r.u64(),
+      grantNonce: r.u64(),
+    };
+    const spent = r.u64();
+    const nextNonce = r.u64();
+    const revoked = r.bool();
+    const subscriptions = r.vec((rr) => ({ stream: rr.hash32(), pricePerRecord: rr.u64() }));
+    if (r.remaining() !== 0) return null; // trailing bytes → not a session state
+    return { grant, spent, nextNonce, revoked, subscriptions };
+  } catch {
+    return null;
+  }
+}
+
+/** Grains this session may still spend. */
+export function sessionRemaining(st: SessionState): bigint {
+  return st.grant.budgetGrains > st.spent ? st.grant.budgetGrains - st.spent : 0n;
+}
+
+/** Whether the session can still act at `round`: not revoked and not expired. */
+export function isActive(st: SessionState, round: bigint | number): boolean {
+  return !st.revoked && BigInt(round) <= st.grant.expiresAtRound;
+}
+
+/** Whether the session is currently paying for `stream`. */
+export function isSubscribed(st: SessionState, stream: Id32): boolean {
+  return st.subscriptions.some((s) => bytesEqual(s.stream, stream));
 }

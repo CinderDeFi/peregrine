@@ -42,10 +42,24 @@ pub use client::{Client, SdkError};
 pub use peregrine_core::{Hash, Keypair, PublicKey, Signature, ValidatorId};
 pub use peregrine_data::streams::{Publisher, StreamId, StreamRecord, StreamShred};
 pub use peregrine_data::tables::{ProvenAbsence, ProvenRead, RangeProof, TableId};
+// ── selective disclosure & compliance (pure, local) ─────────────────────────
+// Building a disclosure or checking compliance needs only the store root, so an
+// application does it in its own process. See `peregrine-data::disclosure` and
+// `peregrine-data::compliance`.
+pub use peregrine_data::compliance::{
+    AttestationBuilder, ComplianceAttestation, CompliancePolicy, ComplianceStatus,
+    SignedAttestation,
+};
+pub use peregrine_data::disclosure::{FieldRow, SelectiveDisclosure};
+// ── oracle & verifiable data feeds ──────────────────────────────────────────
+pub use peregrine_data::feeds::{
+    Aggregation, FeedId, FeedKind, FeedObservation, FeedPublisher, FeedSpec, FeedValue,
+};
 // ── agent sessions & micropayments ──────────────────────────────────────────
 // Re-exported so an agent depends only on `peregrine-sdk`.
 pub use peregrine_data::sessions::{
-    Action, Grains, Scope, SessionBuilder, SessionGrant, SessionSigner, SignedAction, SignedGrant,
+    sessions_table, Action, Grains, Scope, SessionBuilder, SessionGrant, SessionSigner,
+    SessionState, SignedAction, SignedGrant,
 };
 pub use peregrine_vm::Instr;
 

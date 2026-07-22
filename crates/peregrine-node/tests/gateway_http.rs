@@ -10,34 +10,41 @@ use peregrine_node::devnet::Devnet;
 use peregrine_node::gateway;
 use peregrine_sdk::{Client, Instr, TableId};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-/// Minimal HTTP/1.1 `POST /rpc` over a raw socket — a browser's-eye view of the
-/// gateway without dragging in a TLS-linked HTTP client. Returns the parsed
-/// JSON body.
-async fn post_rpc(addr: SocketAddr, body: Value) -> Value {
+/// Minimal HTTP/1.1 `POST /rpc` over a raw blocking socket — a browser's-eye
+/// view of the gateway without dragging in a TLS-linked HTTP client (and without
+/// depending on tokio's io-util). Run on a blocking thread from the async test.
+fn post_rpc_blocking(addr: SocketAddr, body: Value) -> Value {
     let body = serde_json::to_vec(&body).unwrap();
     let req = format!(
         "POST /rpc HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let mut stream = TcpStream::connect(addr).await.expect("connect gateway");
-    stream.write_all(req.as_bytes()).await.unwrap();
-    stream.write_all(&body).await.unwrap();
-    stream.flush().await.unwrap();
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect gateway");
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    stream.flush().unwrap();
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.unwrap();
+    stream.read_to_end(&mut raw).unwrap();
     // Split headers from body at the blank line; the body is the JSON payload.
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .expect("well-formed HTTP response");
     serde_json::from_slice(&raw[split + 4..]).expect("JSON body")
+}
+
+/// Async wrapper so the test reads naturally; the blocking socket runs on a
+/// dedicated thread and never stalls the runtime.
+async fn post_rpc(addr: SocketAddr, body: Value) -> Value {
+    tokio::task::spawn_blocking(move || post_rpc_blocking(addr, body))
+        .await
+        .unwrap()
 }
 
 /// Poll until a key is readable through the native client (commit is async).

@@ -699,6 +699,96 @@ var PeregrineClient = class _PeregrineClient {
   }
 };
 
+// src/disclosure.ts
+var FIELD_LEAF_DOMAIN = new TextEncoder().encode("peregrine.disclosure.field.v1");
+function u32le2(n) {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n, true);
+  return b;
+}
+function fieldLeafBytes(index, arity, value) {
+  return concat(FIELD_LEAF_DOMAIN, u32le2(index), u32le2(arity), value);
+}
+function selectiveDisclosureFromJson(j) {
+  return {
+    read: provenReadFromJson(j.read),
+    arity: j.arity,
+    reveals: j.reveals.map((r) => ({
+      index: r.index,
+      value: fromHex(r.value),
+      proof: { leafIndex: r.proof.leafIndex, siblings: r.proof.siblings.map(fromHex) }
+    }))
+  };
+}
+function verifySelectiveDisclosure(disc, storeRoot) {
+  if (disc.read.value === null || disc.read.value.length !== 32) return false;
+  const fieldRoot = disc.read.value;
+  if (!verifyProvenRead(disc.read, storeRoot)) return false;
+  for (const r of disc.reveals) {
+    if (r.proof.leafIndex !== r.index) return false;
+    if (r.index >= disc.arity) return false;
+    if (!verifyMerkle(fieldLeafBytes(r.index, disc.arity, r.value), r.proof, fieldRoot)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// src/compliance.ts
+var ComplianceStatus = {
+  Unverified: 0,
+  Pending: 1,
+  Verified: 2,
+  Rejected: 3
+};
+var STATUS_NAMES = ["Unverified", "Pending", "Verified", "Rejected"];
+function statusName(code) {
+  return STATUS_NAMES[code] ?? `status(${code})`;
+}
+function complianceTable() {
+  return tableId("sys.compliance");
+}
+function cellKey(subject, attester) {
+  return concat(subject, attester);
+}
+function decodeFlag(bytes) {
+  if (bytes.length !== 11) return null;
+  if (bytes[0] > 3) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    status: bytes[0],
+    scheme: dv.getUint16(1, true),
+    expiresRound: Number(dv.getBigUint64(3, true))
+  };
+}
+function requireCompliant(flag, nowRound, scheme) {
+  if (flag === null) return { ok: false, reason: "no attestation on record" };
+  const f = decodeFlag(flag);
+  if (!f) return { ok: false, reason: "malformed flag" };
+  if (f.status !== ComplianceStatus.Verified) {
+    return { ok: false, reason: `status is ${statusName(f.status)}, not Verified` };
+  }
+  if (nowRound > f.expiresRound) {
+    return { ok: false, reason: `expired at round ${f.expiresRound}` };
+  }
+  if (scheme !== void 0 && f.scheme !== scheme) {
+    return { ok: false, reason: `required scheme ${scheme}, attestation is ${f.scheme}` };
+  }
+  return { ok: true };
+}
+function gate(policy, subject, read, storeRoot, nowRound) {
+  if (!bytesEqual(read.table, complianceTable())) {
+    return { ok: false, reason: "proof is not of the compliance table" };
+  }
+  if (!bytesEqual(read.key, cellKey(subject, policy.attester))) {
+    return { ok: false, reason: "proof is not of this subject/attester cell" };
+  }
+  if (!verifyProvenRead(read, storeRoot)) {
+    return { ok: false, reason: "proof does not verify against the store root" };
+  }
+  return requireCompliant(read.value, nowRound, policy.scheme);
+}
+
 // node_modules/@noble/curves/node_modules/@noble/hashes/utils.js
 function isBytes2(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array" && "BYTES_PER_ELEMENT" in a && a.BYTES_PER_ELEMENT === 1;
@@ -3001,6 +3091,7 @@ function id32FromHex(hex) {
 export {
   ACTION_DOMAIN,
   BincodeWriter,
+  ComplianceStatus,
   GRANT_DOMAIN,
   HttpTransport,
   PeregrineClient,
@@ -3012,15 +3103,22 @@ export {
   SessionSigner,
   encode as bincodeEncode,
   bytesEqual,
+  cellKey,
   combine,
+  complianceTable,
+  decodeFlag,
   digest,
   encodeAction,
   encodeGrant,
+  fieldLeafBytes,
   fromHex,
+  gate,
   id32FromHex,
   provenReadFromJson,
   publicKeyOf,
   readU64LE,
+  requireCompliant,
+  selectiveDisclosureFromJson,
   sessionId,
   signAction,
   signGrant,
@@ -3029,6 +3127,7 @@ export {
   toHex,
   verifyMerkle,
   verifyProvenRead,
+  verifySelectiveDisclosure,
   verifySmt
 };
 /*! Bundled license information:

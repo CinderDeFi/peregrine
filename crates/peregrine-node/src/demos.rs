@@ -968,3 +968,324 @@ pub async fn rwa_templates() -> Result<()> {
     );
     Ok(())
 }
+
+/// Selective disclosure and institutional compliance, end to end.
+///
+/// Two privacy primitives, both verified against the same 32-byte store root a
+/// light client trusts: a KYC record that reveals one field while hiding the
+/// rest, and a signed compliance attestation that gates a transfer. In-process
+/// so the whole flow is legible; every check is the same pure function the SDK
+/// and explorer run.
+pub async fn compliance() -> Result<()> {
+    use crate::pipeline::ExecutionPipeline;
+    use peregrine_core::Keypair;
+    use peregrine_data::compliance::{cell_key, compliance_table, AttestationBuilder, CompliancePolicy};
+    use peregrine_data::disclosure::FieldRow;
+    use peregrine_data::tables::TableId;
+
+    let mut rng = rand::rngs::OsRng;
+    let mut node = ExecutionPipeline::new();
+
+    println!("── act 1 · Selective disclosure ─────────────────────────");
+    // A customer's KYC record. Only its field commitment goes on-chain; the
+    // plaintext fields stay with the owner.
+    let record = FieldRow::new(vec![
+        b"Alice Smith".to_vec(),
+        b"1990-01-01".to_vec(),
+        b"passport-9931".to_vec(),
+        b"US".to_vec(),
+    ]);
+    let table = TableId::named("kyc.records");
+    let key = b"customer-1".to_vec();
+    node.tables
+        .insert(table, key.clone(), record.commit().0.to_vec());
+    let root = node.store_root();
+    let read = node.prove_read(table, &key).expect("row present");
+
+    // The owner discloses only residency (field 3) to a counterparty.
+    let disc = record.disclose(read, &[3]).expect("disclosure");
+    let ok = disc.verify(&root);
+    println!("  committed a 4-field record; its on-chain value is a 32-byte commitment");
+    println!("  disclosed field #3 only:");
+    for (i, v) in disc.revealed() {
+        println!(
+            "    field #{i} = {:?}   {}",
+            String::from_utf8_lossy(v),
+            if ok { "✓ verified against the root" } else { "✗" }
+        );
+    }
+    println!("  name, date of birth and passport number were never sent.\n");
+
+    println!("── act 2 · Compliance-gated transfer ────────────────────");
+    let bank = Keypair::generate(&mut rng); // the attester (a KYC desk)
+    let alice = Keypair::generate(&mut rng); // a KYC'd customer
+    let mallory = Keypair::generate(&mut rng); // never attested
+    let policy = CompliancePolicy::new(bank.public());
+
+    // Before any attestation, a compliant transfer to Alice is refused.
+    match node.compliant_credit(&alice.public(), 1_000, &policy) {
+        Ok(()) => println!("  UNEXPECTED: transfer cleared with no attestation on record"),
+        Err(e) => println!("  transfer to un-attested Alice → refused: {e}"),
+    }
+
+    // The bank attests Alice: Verified, valid for 1000 rounds.
+    let attestation = AttestationBuilder::verified(0, 1_000).sign(&bank, &alice.public());
+    node.apply_attestation(&attestation).expect("valid attestation");
+    println!("  the bank signed a Verified attestation for Alice");
+
+    // Now the same transfer clears — checked against committed state.
+    match node.compliant_credit(&alice.public(), 1_000, &policy) {
+        Ok(()) => println!("  transfer to attested Alice → cleared ✓"),
+        Err(e) => println!("  UNEXPECTED: {e}"),
+    }
+    // Mallory, never attested, still cannot receive under this policy.
+    match node.compliant_credit(&mallory.public(), 1_000, &policy) {
+        Ok(()) => println!("  UNEXPECTED: Mallory cleared"),
+        Err(e) => println!("  transfer to un-attested Mallory → refused: {e}"),
+    }
+
+    // An auditor verifies Alice off-chain, from a proof plus the store root.
+    let cell = node
+        .prove_read(
+            compliance_table(),
+            &cell_key(&alice.public(), &bank.public()),
+        )
+        .expect("cell present");
+    let root = node.store_root();
+    let verified = policy.gate(&alice.public(), &cell, &root, 250).is_ok();
+    println!(
+        "\n  an auditor checks Alice against the store root alone → {}",
+        if verified { "compliant ✓" } else { "✗" }
+    );
+    println!("  no node trusted, no global KYC authority — only the root and the attester you chose.");
+    Ok(())
+}
+
+/// Oracle & verifiable data feeds, end to end.
+///
+/// A multi-source median price feed and a single-source RWA valuation: publish
+/// signed observations, aggregate on commit, and read the latest value back with
+/// a proof against the store root. In-process so the whole path is legible.
+pub async fn oracle() -> Result<()> {
+    use crate::payload::WirePayload;
+    use crate::pipeline::ExecutionPipeline;
+    use peregrine_core::Keypair;
+    use peregrine_data::feeds::{
+        feed_latest_table, Aggregation, FeedId, FeedKind, FeedPublisher, FeedSpec, FeedValue,
+    };
+
+    // Read a feed's latest value with a proof, verify it, and format it.
+    fn read(node: &mut ExecutionPipeline, id: FeedId, now: u64) -> Option<(FeedValue, bool)> {
+        let root = node.store_root();
+        let r = node.prove_read(feed_latest_table(), &id.0 .0)?;
+        let ok = r.verify(&root);
+        FeedValue::decode(&r.value).map(|fv| {
+            let fresh = fv.is_fresh(now, 5);
+            let _ = fresh;
+            (fv, ok)
+        })
+    }
+
+    let mut rng = rand::rngs::OsRng;
+    let mut node = ExecutionPipeline::new();
+
+    println!("── act 1 · A median price feed ──────────────────────────");
+    let providers: Vec<Keypair> = (0..3).map(|_| Keypair::generate(&mut rng)).collect();
+    let spec = FeedSpec {
+        channel: "price/BTC-USD".into(),
+        kind: FeedKind::Price,
+        decimals: 2,
+        aggregation: Aggregation::Median,
+        providers: providers.iter().map(|k| k.public()).collect(),
+        max_staleness_rounds: 5,
+    };
+    let feed_id = node.register_feed(spec.clone());
+    println!("  registered {feed_id:?} — 3 providers, median, 2 decimals");
+    let mut pubs: Vec<FeedPublisher> = providers
+        .into_iter()
+        .map(|k| FeedPublisher::new(&spec, k))
+        .collect();
+
+    node.set_round_for_test(10);
+    for (i, price) in [6_150_000u64, 6_151_000, 6_149_000].iter().enumerate() {
+        node.apply_payload(&WirePayload::Shred(pubs[i].observe_at(*price, 0)));
+        println!("  provider #{i} reports ${:.2}", *price as f64 / 100.0);
+    }
+    if let Some((fv, ok)) = read(&mut node, feed_id, 12) {
+        println!(
+            "  → latest = ${:.2}  ({} sources, round {})  {}",
+            fv.as_f64(),
+            fv.n_sources,
+            fv.updated_round,
+            if ok { "✓ proven against the store root" } else { "✗" }
+        );
+    }
+
+    println!("\n── act 2 · A source goes dark ───────────────────────────");
+    node.set_round_for_test(20); // 20 - 10 = 10 rounds > max_staleness 5
+    for i in [0usize, 1] {
+        let price = if i == 0 { 6_200_000 } else { 6_202_000 };
+        node.apply_payload(&WirePayload::Shred(pubs[i].observe_at(price, 0)));
+    }
+    println!("  providers #0 and #1 refresh; #2 has been silent past the staleness bound");
+    if let Some((fv, _)) = read(&mut node, feed_id, 22) {
+        println!(
+            "  → latest = ${:.2}  ({} sources — the stale one was dropped from the median)",
+            fv.as_f64(),
+            fv.n_sources
+        );
+    }
+
+    println!("\n── act 3 · A single-source RWA valuation ────────────────");
+    let appraiser = Keypair::generate(&mut rng);
+    let rwa = FeedSpec {
+        channel: "rwa/BUILDING-7".into(),
+        kind: FeedKind::Rwa,
+        decimals: 0,
+        aggregation: Aggregation::Single,
+        providers: vec![appraiser.public()],
+        max_staleness_rounds: 1000,
+    };
+    let rwa_id = node.register_feed(rwa.clone());
+    let mut appr = FeedPublisher::new(&rwa, appraiser);
+    node.set_round_for_test(21);
+    node.apply_payload(&WirePayload::Shred(appr.observe_at(2_500_000, 0)));
+    if let Some((fv, ok)) = read(&mut node, rwa_id, 21) {
+        println!(
+            "  {:?} valued at {} units  {}",
+            rwa_id,
+            fv.value,
+            if ok { "✓ proven" } else { "✗" }
+        );
+    }
+    println!("\n  every value above is committed table state — a contract or agent reads it");
+    println!("  with a 32-byte root and nothing else to trust.");
+    Ok(())
+}
+
+/// An autonomous agent pays for verifiable oracle data with a scoped, budgeted
+/// session key — the full agent-payments path in one story.
+///
+/// The point: the agent holds a key the whole time, yet it can only ever spend
+/// what its principal allotted, only on the data it was scoped to, and stops the
+/// instant it is revoked — all enforced by consensus, and its remaining budget
+/// is *provable*, not merely reported.
+pub async fn agent_data() -> Result<()> {
+    use crate::payload::WirePayload;
+    use crate::pipeline::ExecutionPipeline;
+    use peregrine_core::{Hash, Keypair};
+    use peregrine_data::feeds::{
+        feed_latest_table, Aggregation, FeedKind, FeedPublisher, FeedSpec, FeedValue,
+    };
+    use peregrine_data::sessions::{
+        balances_table, sessions_table, sign_revocation, SessionBuilder, SessionSigner,
+        SessionState,
+    };
+
+    // Prove-and-read the agent's own remaining budget (what `read_session` does).
+    fn remaining(node: &mut ExecutionPipeline, id: Hash) -> u64 {
+        let root = node.store_root();
+        let read = node.prove_read(sessions_table(), &id.0).expect("session");
+        assert!(read.verify(&root));
+        SessionState::from_bytes(&read.value).unwrap().remaining()
+    }
+    fn latest(node: &mut ExecutionPipeline, feed: peregrine_data::feeds::FeedId) -> f64 {
+        let root = node.store_root();
+        let read = node.prove_read(feed_latest_table(), &feed.0 .0).expect("feed");
+        assert!(read.verify(&root));
+        FeedValue::decode(&read.value).unwrap().as_f64()
+    }
+    let bal = |n: &ExecutionPipeline, pk: &peregrine_core::PublicKey| -> u64 {
+        n.tables
+            .get(&balances_table(), &pk.0)
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    };
+
+    let mut rng = rand::rngs::OsRng;
+    let principal = Keypair::generate(&mut rng); // the human's cold key
+    let agent_key = Keypair::generate(&mut rng); // the agent's throwaway key
+    let oracle = Keypair::generate(&mut rng); // sells a price feed
+    let oracle_pk = oracle.public();
+
+    let mut node = ExecutionPipeline::new();
+
+    println!("── act 1 · a price feed to pay for ──────────────────────");
+    let spec = FeedSpec {
+        channel: "price/BTC-USD".into(),
+        kind: FeedKind::Price,
+        decimals: 2,
+        aggregation: Aggregation::Single,
+        providers: vec![oracle_pk],
+        max_staleness_rounds: 1000,
+    };
+    let feed_id = node.register_feed(spec.clone());
+    let mut feed_pub = FeedPublisher::new(&spec, oracle);
+    println!("  registered {feed_id:?} (1 source, 2 decimals)");
+
+    println!("\n── act 2 · a bounded delegation ─────────────────────────");
+    // Scope exactly the feed's source, cap the total spend and the per-record
+    // price. `try_sign` refuses a funded session that could never spend.
+    let grant = SessionBuilder::new(100)
+        .allow_streams(spec.provider_streams())
+        .budget(20) // total the agent may ever spend
+        .max_per_action(2) // and never more than this per record
+        .try_sign(&principal, &agent_key.public())
+        .expect("well-formed grant");
+    let session_id = grant.grant.id();
+    node.set_round_for_test(1);
+    node.open_session(&grant)?;
+    println!("  session {}          opened", session_id.short());
+    println!("  budget 20 grains · max 2/record · scoped to the feed · expires round 100");
+
+    let mut signer = SessionSigner::new(agent_key, session_id);
+    node.apply_payload(&WirePayload::SessionAction(Box::new(
+        signer.subscribe(spec.provider_streams()[0], 2),
+    )));
+    println!("  one signature → subscribed at 2 grains/update");
+
+    println!("\n── act 3 · pay-per-update, read verified ────────────────");
+    for (i, price) in [6_150_000u64, 6_151_000, 6_149_500, 6_152_000, 6_150_500]
+        .iter()
+        .enumerate()
+    {
+        node.apply_payload(&WirePayload::Shred(feed_pub.observe_at(*price, 0)));
+        if i == 4 {
+            println!(
+                "  after 5 updates → feed = ${:.2} (proven), agent paid {} grains, {} remaining",
+                latest(&mut node, feed_id),
+                bal(&node, &oracle_pk),
+                remaining(&mut node, session_id),
+            );
+        }
+    }
+
+    println!("\n── act 4 · the budget is a hard ceiling ─────────────────");
+    for i in 0..40u64 {
+        node.apply_payload(&WirePayload::Shred(feed_pub.observe_at(6_160_000 + i, 0)));
+    }
+    println!(
+        "  40 more updates flow → agent paid {} of 20 (never more), {} remaining",
+        bal(&node, &oracle_pk),
+        remaining(&mut node, session_id),
+    );
+    println!("  the data keeps flowing; an out-of-budget agent just stops paying.");
+
+    println!("\n── act 5 · revocation ───────────────────────────────────");
+    let before = bal(&node, &oracle_pk);
+    node.revoke_session(&session_id, &sign_revocation(&principal, &session_id));
+    for _ in 0..5 {
+        node.apply_payload(&WirePayload::Shred(feed_pub.observe_at(6_170_000, 0)));
+    }
+    println!(
+        "  principal revoked → meter stopped {}",
+        ok(bal(&node, &oracle_pk) == before)
+    );
+    println!(
+        "\n  The agent never spent past 20, never paid more than 2 at once, only\n\
+         ever paid for the one feed it was scoped to, proved its own balance at\n\
+         every step, and stopped the instant its principal said so.\n"
+    );
+    Ok(())
+}

@@ -28,7 +28,7 @@ use peregrine_node::devnet::{Devnet, DevnetOptions};
 use peregrine_node::sim::SimOptions;
 use peregrine_sdk::Client;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -90,6 +90,98 @@ enum Command {
     /// Serve an HTTP/JSON gateway that fronts a node's QUIC RPC (for the web
     /// explorer and other browser clients). Read-only; CORS-permissive.
     Gateway(GatewayArgs),
+    /// Generate or inspect a testnet genesis.
+    #[command(subcommand)]
+    Genesis(GenesisCmd),
+    /// Testnet faucet: drip tokens (as the operator) or serve a web faucet.
+    #[command(subcommand)]
+    Faucet(FaucetCmd),
+}
+
+#[derive(Subcommand)]
+enum GenesisCmd {
+    /// Generate a fresh testnet genesis plus the validator and faucet keys.
+    New(GenesisNewArgs),
+    /// Summarise a genesis file (chain id, validators, faucet, allocations).
+    Show(GenesisShowArgs),
+}
+
+#[derive(Args)]
+struct GenesisNewArgs {
+    /// Number of validators (>= 2; 4 for fault tolerance).
+    #[arg(long, default_value_t = 4)]
+    validators: u16,
+    /// The network's chain id (non-zero). Pinned by the EVM light client.
+    #[arg(long)]
+    chain_id: u64,
+    /// Human-readable network name.
+    #[arg(long, default_value = "peregrine-testnet")]
+    network: String,
+    /// Include a faucet authority (on by default; pass --no-faucet to omit).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    faucet: bool,
+    /// Where to write the genesis file.
+    #[arg(long, short = 'o', value_name = "PATH", default_value = "genesis.toml")]
+    out: PathBuf,
+    /// Directory for the generated secret keys.
+    #[arg(long, value_name = "DIR", default_value = "testnet-keys")]
+    keys_dir: PathBuf,
+    /// Overwrite existing files.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct GenesisShowArgs {
+    /// The genesis file to summarise.
+    #[arg(default_value = "genesis.toml")]
+    path: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum FaucetCmd {
+    /// Drip tokens to an address, signing with the faucet key (operator use).
+    Drip(FaucetDripArgs),
+    /// Serve a rate-limited web faucet over HTTP.
+    Serve(FaucetServeArgs),
+}
+
+#[derive(Args)]
+struct FaucetDripArgs {
+    /// Recipient public key (64 hex chars).
+    recipient: String,
+    /// Grains to drip (subject to the on-chain per-request cap).
+    #[arg(long, default_value_t = 1_000)]
+    amount: u64,
+    /// The faucet secret key file.
+    #[arg(long, value_name = "PATH", default_value = "testnet-keys/faucet.key")]
+    faucet_key: PathBuf,
+    /// A nonce distinguishing this drip from an identical earlier one.
+    #[arg(long, default_value_t = 0)]
+    nonce: u64,
+    /// Node RPC address (default: the configured node.rpc_addr).
+    #[arg(long, value_name = "ADDR")]
+    rpc_addr: Option<SocketAddr>,
+}
+
+#[derive(Args)]
+struct FaucetServeArgs {
+    /// HTTP address to listen on.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8088")]
+    bind: SocketAddr,
+    /// Node RPC address to submit drips to (default: the configured node.rpc_addr).
+    #[arg(long, value_name = "ADDR")]
+    node: Option<SocketAddr>,
+    /// The faucet secret key file.
+    #[arg(long, value_name = "PATH", default_value = "testnet-keys/faucet.key")]
+    faucet_key: PathBuf,
+    /// Grains per web request (subject to the on-chain per-request cap).
+    #[arg(long, default_value_t = 1_000)]
+    amount: u64,
+    /// Minimum seconds between requests from the same IP (soft, on top of the
+    /// hard on-chain per-recipient cooldown).
+    #[arg(long, default_value_t = 60)]
+    per_ip_cooldown_secs: u64,
 }
 
 #[derive(Args)]
@@ -141,6 +233,13 @@ struct NodeRunArgs {
     /// Run purely in memory, ignoring any configured storage path.
     #[arg(long, conflicts_with = "storage")]
     in_memory: bool,
+    /// Launch from a genesis file (sets the committee, chain id, faucet, and
+    /// initial allocations). Requires `--keys-dir` holding the validator keys.
+    #[arg(long, value_name = "PATH")]
+    genesis: Option<PathBuf>,
+    /// Directory holding `validator-{i}.key` for a genesis launch.
+    #[arg(long, value_name = "DIR", requires = "genesis")]
+    keys_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -227,6 +326,12 @@ enum ExampleName {
     Agent,
     /// RWA contract templates: title, valuation, proven-collateral health.
     RwaTemplates,
+    /// Selective disclosure of a KYC record + a compliance-gated transfer.
+    Compliance,
+    /// Oracle feeds: a multi-source median price feed and an RWA valuation.
+    Oracle,
+    /// An agent pays for verifiable oracle data with a scoped, budgeted session.
+    AgentData,
 }
 
 #[derive(Args)]
@@ -283,6 +388,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Config(cmd) => run_config(cmd, &cfg, source.as_deref()),
         Command::Keygen(args) => run_keygen(args),
+        // Genesis is pure file work; no runtime needed.
+        Command::Genesis(cmd) => run_genesis(cmd),
         other => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -332,6 +439,9 @@ async fn run_async(cmd: Command, cfg: Config) -> Result<()> {
             ExampleName::LightClient => peregrine_node::demos::light_client().await,
             ExampleName::Agent => peregrine_node::demos::agent().await,
             ExampleName::RwaTemplates => peregrine_node::demos::rwa_templates().await,
+            ExampleName::Compliance => peregrine_node::demos::compliance().await,
+            ExampleName::Oracle => peregrine_node::demos::oracle().await,
+            ExampleName::AgentData => peregrine_node::demos::agent_data().await,
         },
         Command::SubmitTx(args) => run_submit_tx(args, cfg).await,
         Command::Watch(args) => {
@@ -351,8 +461,10 @@ async fn run_async(cmd: Command, cfg: Config) -> Result<()> {
             let node = args.node.unwrap_or(cfg.node.rpc_addr);
             peregrine_node::gateway::serve(args.bind, node).await
         }
+        Command::Faucet(FaucetCmd::Drip(args)) => run_faucet_drip(args, cfg).await,
+        Command::Faucet(FaucetCmd::Serve(args)) => run_faucet_serve(args, cfg).await,
         // Handled synchronously in `main`.
-        Command::Config(_) | Command::Keygen(_) => unreachable!(),
+        Command::Config(_) | Command::Keygen(_) | Command::Genesis(_) => unreachable!(),
     }
 }
 
@@ -360,23 +472,56 @@ async fn run_node(args: NodeRunArgs, cfg: Config) -> Result<()> {
     let storage = if args.in_memory {
         None
     } else {
-        args.storage.or(cfg.storage.path.clone())
+        args.storage.clone().or(cfg.storage.path.clone())
     };
 
-    let opts = DevnetOptions {
-        validators: args.validators.unwrap_or(cfg.node.validators),
-        rpc_addr: args.rpc_addr.unwrap_or(cfg.node.rpc_addr),
-        max_items_per_vertex: cfg.node.max_items_per_vertex,
-        stream: cfg.node.stream.clone(),
-        storage: storage.clone(),
+    let rpc_addr = args.rpc_addr.unwrap_or(cfg.node.rpc_addr);
+    let (devnet, n_validators) = if let Some(gpath) = &args.genesis {
+        // Launch from a genesis: committee, chain id, faucet, and allocations
+        // all come from the file, and each validator loads its own key.
+        let genesis =
+            peregrine_node::genesis::Genesis::load(gpath).context("load genesis")?;
+        let keys_dir = args
+            .keys_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--keys-dir is required with --genesis"))?;
+        let keys = load_validator_keys(&keys_dir, genesis.validators.len())?;
+        let n = genesis.validators.len() as u16;
+        println!(
+            "launching from genesis: chain_id {} ({}), {} validators",
+            genesis.chain_id, genesis.network, n
+        );
+        if genesis.faucet.is_some() {
+            println!("  faucet     : configured");
+        }
+        let runtime = genesis.runtime(keys).context("bind genesis to keys")?;
+        let opts = DevnetOptions {
+            validators: n,
+            rpc_addr,
+            max_items_per_vertex: genesis.params.max_items_per_vertex,
+            stream: cfg.node.stream.clone(),
+            storage: storage.clone(),
+        };
+        (
+            Devnet::launch_from_genesis(opts, runtime)
+                .await
+                .context("launch from genesis")?,
+            n,
+        )
+    } else {
+        let n = args.validators.unwrap_or(cfg.node.validators);
+        let opts = DevnetOptions {
+            validators: n,
+            rpc_addr,
+            max_items_per_vertex: cfg.node.max_items_per_vertex,
+            stream: cfg.node.stream.clone(),
+            storage: storage.clone(),
+        };
+        (Devnet::launch(opts).await.context("launch node")?, n)
     };
 
-    let devnet = Devnet::launch(opts).await.context("launch node")?;
     println!("peregrine node running");
-    println!(
-        "  validators : {}",
-        args.validators.unwrap_or(cfg.node.validators)
-    );
+    println!("  validators : {n_validators}");
     println!("  rpc        : {}", devnet.rpc_addr);
     println!("  stream     : {}", cfg.node.stream);
     println!(
@@ -527,6 +672,137 @@ fn run_config(cmd: ConfigCmd, cfg: &Config, source: Option<&std::path::Path>) ->
             Ok(())
         }
     }
+}
+
+/// Load an ed25519 secret from a keyfile (hex seed, as `keygen` writes).
+fn load_secret_key(path: &Path) -> Result<Keypair> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read key file {}", path.display()))?;
+    let bytes = hex::decode(text.trim())
+        .with_context(|| format!("decode key file {}", path.display()))?;
+    let seed: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{}: key must be 32 bytes", path.display()))?;
+    Ok(Keypair::from_bytes(&seed))
+}
+
+/// Load `validator-{0..n}.key` from a directory, in committee order.
+fn load_validator_keys(dir: &Path, n: usize) -> Result<Vec<Keypair>> {
+    (0..n)
+        .map(|i| load_secret_key(&dir.join(format!("validator-{i}.key"))))
+        .collect()
+}
+
+/// Parse a 64-hex-char public key.
+fn parse_pubkey_hex(s: &str) -> Result<peregrine_core::PublicKey> {
+    let bytes = hex::decode(s.trim()).context("decode public key hex")?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("public key must be 32 bytes, got {}", bytes.len()))?;
+    Ok(peregrine_core::PublicKey(arr))
+}
+
+fn run_genesis(cmd: GenesisCmd) -> Result<()> {
+    use peregrine_node::genesis::Genesis;
+    match cmd {
+        GenesisCmd::New(args) => {
+            if args.chain_id == 0 {
+                anyhow::bail!("--chain-id must be non-zero");
+            }
+            if args.out.exists() && !args.force {
+                anyhow::bail!("{} already exists (pass --force)", args.out.display());
+            }
+            let (genesis, validators, faucet) =
+                Genesis::generate(args.validators, args.chain_id, &args.network, args.faucet);
+            genesis.validate()?;
+
+            std::fs::create_dir_all(&args.keys_dir)
+                .with_context(|| format!("create {}", args.keys_dir.display()))?;
+            std::fs::write(&args.out, genesis.to_toml()?)
+                .with_context(|| format!("write {}", args.out.display()))?;
+            for (i, kp) in validators.iter().enumerate() {
+                let p = args.keys_dir.join(format!("validator-{i}.key"));
+                std::fs::write(&p, format!("{}\n", hex::encode(kp.to_bytes())))?;
+                restrict_permissions(&p);
+            }
+            if let Some(f) = &faucet {
+                let p = args.keys_dir.join("faucet.key");
+                std::fs::write(&p, format!("{}\n", hex::encode(f.to_bytes())))?;
+                restrict_permissions(&p);
+            }
+
+            println!("genesis written to {}", args.out.display());
+            println!("  chain id   : {}", genesis.chain_id);
+            println!("  network    : {}", genesis.network);
+            println!("  validators : {}", genesis.validators.len());
+            println!("  keys       : {}/", args.keys_dir.display());
+            if let Some(f) = &faucet {
+                println!("  faucet     : {}", hex::encode(f.public().0));
+            }
+            println!(
+                "\nStart it with:\n  peregrine node run --genesis {} --keys-dir {}",
+                args.out.display(),
+                args.keys_dir.display()
+            );
+            Ok(())
+        }
+        GenesisCmd::Show(args) => {
+            let g = Genesis::load(&args.path)?;
+            println!("chain id   : {}", g.chain_id);
+            println!("network    : {}", g.network);
+            println!("params     : max_items_per_vertex={}", g.params.max_items_per_vertex);
+            println!("validators : {}", g.validators.len());
+            for (i, v) in g.validators.iter().enumerate() {
+                println!("  [{i}] stake {:<6} {}", v.stake, v.public_key);
+            }
+            match &g.faucet {
+                Some(f) => println!(
+                    "faucet     : {}\n             per_request {}, cooldown {} rounds, lifetime {}",
+                    f.authority, f.per_request, f.cooldown_rounds, f.lifetime_cap
+                ),
+                None => println!("faucet     : none"),
+            }
+            println!("allocations: {}", g.allocations.len());
+            Ok(())
+        }
+    }
+}
+
+async fn run_faucet_drip(args: FaucetDripArgs, cfg: Config) -> Result<()> {
+    let faucet = load_secret_key(&args.faucet_key)?;
+    let recipient = parse_pubkey_hex(&args.recipient)?;
+    let addr = args.rpc_addr.unwrap_or(cfg.node.rpc_addr);
+    let client = connect(addr).await?;
+
+    let drip = peregrine_data::faucet::FaucetDrip {
+        recipient,
+        amount: args.amount,
+        nonce: args.nonce,
+    };
+    client
+        .submit_drip(peregrine_data::faucet::SignedDrip::new(&faucet, drip))
+        .await
+        .context("submit drip")?;
+    println!("dripped {} grains to {} (queued)", args.amount, args.recipient);
+    println!(
+        "the on-chain per-recipient limits still apply — confirm with the recipient's balance."
+    );
+    Ok(())
+}
+
+async fn run_faucet_serve(args: FaucetServeArgs, cfg: Config) -> Result<()> {
+    let faucet = load_secret_key(&args.faucet_key)?;
+    let node = args.node.unwrap_or(cfg.node.rpc_addr);
+    peregrine_node::faucet_server::serve(peregrine_node::faucet_server::FaucetServerConfig {
+        bind: args.bind,
+        node,
+        faucet,
+        amount: args.amount,
+        per_ip_cooldown: std::time::Duration::from_secs(args.per_ip_cooldown_secs),
+    })
+    .await
 }
 
 fn run_keygen(args: KeygenArgs) -> Result<()> {

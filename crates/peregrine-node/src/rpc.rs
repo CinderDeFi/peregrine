@@ -190,6 +190,12 @@ fn request_cost(req: &RpcRequest) -> u32 {
         // costs more: it is a signature plus permanent state.
         RpcRequest::SessionAction(_) | RpcRequest::RevokeSession { .. } => cost::SUBMIT,
         RpcRequest::OpenSession(_) => cost::SUBMIT * 2,
+        // One attester signature to verify, like any other signed submission.
+        RpcRequest::SubmitAttestation(_) => cost::SUBMIT,
+        // Registering a feed is one-time and permanent state, like opening a session.
+        RpcRequest::RegisterFeed(_) => cost::SUBMIT * 2,
+        // A drip is one signature to verify, like any other signed submission.
+        RpcRequest::FaucetDrip(_) => cost::SUBMIT,
     }
 }
 
@@ -239,6 +245,20 @@ async fn dispatch(
             // proof is verified during commit by every validator, not here.
             // The RPC layer's job is admission control, not verification.
             accept(ingest_tx.send(WirePayload::ForeignClaim(claim)).await)
+        }
+
+        RpcRequest::SubmitAttestation(att) => {
+            // Same discipline as a claim: the attester's signature is verified
+            // during commit on every validator, not in this admission layer.
+            accept(ingest_tx.send(WirePayload::Attestation(att)).await)
+        }
+
+        RpcRequest::RegisterFeed(spec) => {
+            accept(ingest_tx.send(WirePayload::RegisterFeed(spec)).await)
+        }
+
+        RpcRequest::FaucetDrip(signed) => {
+            accept(ingest_tx.send(WirePayload::FaucetDrip(signed)).await)
         }
 
         RpcRequest::ProveRead { table, key } => {

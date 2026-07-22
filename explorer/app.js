@@ -19,6 +19,10 @@ import {
   tableId,
   fromHex,
   toHex,
+  verifySelectiveDisclosure,
+  selectiveDisclosureFromJson,
+  gate,
+  decodeFlag,
 } from "./vendor/peregrine-sdk.js";
 import { DemoTransport } from "./demo-transport.js";
 
@@ -70,6 +74,7 @@ async function boot() {
     const data = await (await fetch("./demo-data.json")).json();
     transport = new DemoTransport(data);
     state.catalog = data.catalog;
+    state.demoData = data;
     $("banner").innerHTML =
       `<b>Offline demo.</b> ${data.note} ` +
       `To point this at a live node, run <code>peregrine node run</code> then ` +
@@ -85,8 +90,68 @@ async function boot() {
 
   renderWatchSkeleton();
   wireUI();
+  renderDisclosureCompliance();
   tick(); // immediate first paint
   setInterval(tick, 1000);
+}
+
+// ── selective disclosure & compliance (demo fixtures, verified in-browser) ────
+
+const STATUS_NAMES = ["Unverified", "Pending", "Verified", "Rejected"];
+
+function decodeField(bytes) {
+  if (bytes.length && bytes.every((b) => b >= 0x20 && b < 0x7f)) {
+    return new TextDecoder().decode(bytes);
+  }
+  return "0x" + toHex(bytes);
+}
+
+function renderDisclosureCompliance() {
+  const data = state.demoData;
+  if (!data || (!data.disclosure && !data.compliance)) return;
+  $("disclosure").style.display = "";
+
+  if (data.disclosure) {
+    const d = data.disclosure;
+    const disc = selectiveDisclosureFromJson(d);
+    const ok = verifySelectiveDisclosure(disc, fromHex(d.storeRoot));
+    const revealed = new Map(disc.reveals.map((r) => [r.index, r.value]));
+    let rows = "";
+    for (let i = 0; i < d.arity; i++) {
+      if (revealed.has(i)) {
+        rows += `<div class="field"><span class="idx">#${i}</span><span class="fv">${escapeHtml(decodeField(revealed.get(i)))}</span><span class="badge ok">✓ revealed</span></div>`;
+      } else {
+        rows += `<div class="field"><span class="idx">#${i}</span><span class="fv hidden">•••• hidden</span><span class="badge absent">— not disclosed</span></div>`;
+      }
+    }
+    $("discOut").innerHTML =
+      `<div class="headline"><span class="badge ${ok ? "ok" : "bad"}">${ok ? "✓ verified against the store root" : "✗ failed"}</span></div>` +
+      `<div class="kv">field commitment ${toHex(disc.read.value)}</div>` +
+      `<div style="margin-top:10px">${rows}</div>` +
+      `<p class="hint" style="margin:10px 0 0">${disc.reveals.length} of ${d.arity} fields revealed; the rest are committed but never sent — a KYC record proving residency and date of birth without exposing name or passport number.</p>`;
+  }
+
+  if (data.compliance) {
+    const c = data.compliance;
+    const read = provenReadFromJson(c.read);
+    const root = fromHex(c.storeRoot);
+    const policy = { attester: fromHex(c.attester), scheme: c.scheme };
+    const subject = fromHex(c.subject);
+    const now = gate(policy, subject, read, root, c.nowRound);
+    const expired = gate(policy, subject, read, root, c.expiredNowRound);
+    const wrong = gate({ attester: fromHex(c.otherAttester) }, subject, read, root, c.nowRound);
+    const flag = decodeFlag(read.value) ?? {};
+    const statusName = STATUS_NAMES[flag.status] ?? "?";
+    $("compOut").innerHTML =
+      `<div class="headline"><span class="badge ${now.ok ? "ok" : "bad"}">${now.ok ? "✓ compliant" : "✗ " + now.reason}</span></div>` +
+      `<div class="kv">subject   ${c.subject.slice(0, 22)}…</div>` +
+      `<div class="kv">attester  ${c.attester.slice(0, 22)}…</div>` +
+      `<div class="kv">flag      ${statusName} · scheme ${flag.scheme} · expires round ${flag.expiresRound}</div>` +
+      `<div style="margin-top:8px" class="field"><span class="idx"></span><span class="fv">at round ${c.nowRound}</span><span class="badge ${now.ok ? "ok" : "bad"}">${now.ok ? "✓ passes gate" : "✗"}</span></div>` +
+      `<div class="field"><span class="idx"></span><span class="fv">at round ${c.expiredNowRound}</span><span class="badge ${expired.ok ? "ok" : "bad"}">${expired.ok ? "✓" : "✗ expired"}</span></div>` +
+      `<div class="field"><span class="idx"></span><span class="fv">a different attester</span><span class="badge ${wrong.ok ? "ok" : "bad"}">${wrong.ok ? "✓" : "✗ wrong cell"}</span></div>` +
+      `<p class="hint" style="margin:10px 0 0">The gate reads the committed flag against the store root — no signature re-check, no global authority. Requiring another attester reads a different, empty cell.</p>`;
+  }
 }
 
 /** A few well-known keys to watch on a fresh devnet (see `peregrine demo`). */

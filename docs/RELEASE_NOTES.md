@@ -63,8 +63,7 @@ Before this release an internal security review covered the ~3,660
 consensus-critical lines. It found a real one — a consensus round-structure check
 written as a `debug_assert`, compiled out of release builds — plus five
 lower-severity items. All are fixed and written up with resolutions in
-[`AUDIT.md`](../AUDIT.md), alongside the scope, trust boundaries, nineteen named
-invariants, a threat model, and a ranked list of what to attack first.
+[`AUDIT.md`](../AUDIT.md), alongside the scope, trust boundaries, twenty-three named invariants, a threat model, and a ranked list of what to attack first.
 
 **Still true, and stated plainly:** not third-party audited, never deployed, no
 token. Committee rotation for the Ethereum → Peregrine direction is not
@@ -84,9 +83,9 @@ committed fixture is ever absent, so it can never be mistaken for a pass.
 
 | Suite | Result |
 | --- | --- |
-| Rust workspace | 222 passing |
+| Rust workspace | 277 passing |
 | Solidity (Foundry, incl. fuzzing + real-proof e2e) | 48 passing |
-| TypeScript verifier | 60 passing |
+| TypeScript verifier | 82 passing |
 
 ## What's next
 

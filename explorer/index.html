@@ -90,7 +90,13 @@
   .commit .t { font-size: .78rem; color: var(--muted); white-space: nowrap; }
   .commit.new { border-color: var(--ok); }
 
-  .result { margin-top: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .grid2 { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .field { display: grid; grid-template-columns: 3ch 1fr auto; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: .9rem; }
+  .field:last-child { border-bottom: 0; }
+  .field .idx { font-family: var(--mono); color: var(--muted); font-size: .78rem; }
+  .field .fv { font-family: var(--mono); word-break: break-all; }
+  .field .hidden { color: var(--muted); letter-spacing: 3px; }
+  .result { margin-top: 0; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
   .result .kv { font-family: var(--mono); font-size: .82rem; color: var(--muted); word-break: break-all; margin: 2px 0; }
   .result .headline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
   .result .headline .val { font-family: var(--mono); font-size: 1.1rem; font-weight: 600; }
@@ -157,6 +163,21 @@
       <span class="chip" id="tamperChip" data-on="false" title="Corrupt the value before verifying">tamper: off</span>
     </div>
     <div id="searchOut"></div>
+  </section>
+
+  <section id="disclosure" style="display:none">
+    <h2>Selective disclosure &amp; compliance</h2>
+    <p class="hint">Privacy primitives, verified the same way as everything else — against the store root, in your browser. A <b>selective disclosure</b> reveals chosen fields of a committed row while the rest stay hidden. A <b>compliance</b> check reads a KYC/AML flag an attester signed, without trusting anyone but the root and the attester you chose.</p>
+    <div class="grid2">
+      <div>
+        <h3 style="margin:0 0 8px">Selective disclosure</h3>
+        <div class="result" id="discOut"></div>
+      </div>
+      <div>
+        <h3 style="margin:0 0 8px">Compliance</h3>
+        <div class="result" id="compOut"></div>
+      </div>
+    </div>
   </section>
 
 </div>

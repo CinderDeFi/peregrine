@@ -189,6 +189,10 @@ question is "can I violate this?"
 | V6 | A session key can only ever do **less** than its principal: scope is an allow-list, spend is capped per action and in total, and authority ends at a committed round. | `sessions.rs` |
 | V7 | A refused session action changes no state — no debit, no nonce bump, no partial write. | `pipeline.rs` |
 | V8 | Only a principal may revoke its session; revocation is immediate and terminal. | `pipeline.rs` |
+| D1 | A selective disclosure reveals only its stated fields, each bound to its index and the row's arity, under a field root that is itself committed under the store root — a tampered field, a swapped index, or a foreign root all fail. | `disclosure.rs`, `disclosure.ts` |
+| C1 | A compliance gate passes only for a **Verified**, unexpired attestation from the **required attester** in committed state; absence is a hard refusal, never a silent pass. | `compliance.rs`, `compliance.ts` |
+| C2 | A compliance flag is materialized only after the *named* attester's signature verifies, so a statement is attributable and cannot be forged onto an attester who did not make it. | `pipeline.rs` |
+| O1 | A feed value aggregates only its **authorised, fresh** sources: a provider past the staleness bound is dropped, and only a key named in the (content-addressed) feed id can contribute — an unauthorised publisher's records never reach `sys.feed_latest`. | `feeds.rs`, `pipeline.rs` |
 
 **V5 is the newest and least battle-tested.** v2 non-inclusion has two shapes
 (empty slot, or a different key occupying it), and the second requires checking
@@ -399,7 +403,11 @@ such rather than omitted.
 | V6 | a session key can only do less than its principal | `sessions.rs` unit tests; `agent_sessions.rs` |
 | V7 | a refused session action changes no state | `agent_sessions.rs::a_refused_action_changes_no_state` |
 | V8 | only a principal may revoke | `agent_sessions.rs::only_the_principal_can_revoke` |
-| — | **cross-language encoding** (Rust ⇄ TS) | `sdk/js/test/verify.test.ts`, `sdk/js/test/sessions.test.ts` — byte equality against Rust fixtures, regenerated in CI |
+| D1 | selective disclosure reveals only stated, index/arity-bound fields | `disclosure.rs` tests; `compliance_disclosure.rs`; `sdk/js/test/selective.test.ts` |
+| C1 | compliance gate needs a Verified, unexpired attestation from the required attester; absence refuses | `compliance.rs` tests; `compliance_disclosure.rs::a_transfer_is_gated_on_committed_compliance`; `sdk/js/test/selective.test.ts` |
+| C2 | a compliance flag is written only after the named attester's signature verifies | `compliance_disclosure.rs::a_forged_attestation_is_refused_and_writes_nothing` |
+| O1 | a feed aggregates only authorised, fresh sources; a dark source is dropped and an unauthorised publisher cannot contribute | `feeds.rs` tests; `oracle_feeds.rs`; `sdk/js/test/feed.test.ts` |
+| — | **cross-language encoding** (Rust ⇄ TS) | `sdk/js/test/verify.test.ts`, `sdk/js/test/sessions.test.ts`, `sdk/js/test/selective.test.ts` — byte equality against Rust fixtures, regenerated in CI |
 
 **Gaps a reviewer should know about:**
 

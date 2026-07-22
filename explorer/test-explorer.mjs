@@ -7,7 +7,18 @@
  */
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
-import { PeregrineClient, verifyProvenRead, provenReadFromJson, fromHex, toHex } from "./vendor/peregrine-sdk.js";
+import {
+  PeregrineClient,
+  verifyProvenRead,
+  provenReadFromJson,
+  fromHex,
+  toHex,
+  verifySelectiveDisclosure,
+  selectiveDisclosureFromJson,
+  gate,
+  decodeFlag,
+  ComplianceStatus,
+} from "./vendor/peregrine-sdk.js";
 import { DemoTransport } from "./demo-transport.js";
 
 const here = new URL(".", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
@@ -62,6 +73,27 @@ const r0 = toHex(await c2.storeRoot());
 await c2.storeRoot();
 const r2 = toHex(await c2.storeRoot());
 ok(r0 !== r2, "the simulated head advances to a new committed root");
+
+// 4. Selective disclosure + compliance embedded in the demo data verify for real.
+if (data.disclosure) {
+  const d = data.disclosure;
+  const disc = selectiveDisclosureFromJson(d);
+  ok(verifySelectiveDisclosure(disc, fromHex(d.storeRoot)), "demo disclosure verifies");
+  ok(!verifySelectiveDisclosure(disc, new Uint8Array(32)), "disclosure refused vs wrong root");
+  // hidden fields never appear in the reveal payload
+  const blob = JSON.stringify(d.reveals);
+  for (const i of d.hiddenIndices) ok(!blob.includes(d.allFields[i]), `hidden field ${i} not leaked`);
+}
+if (data.compliance) {
+  const c = data.compliance;
+  const read = provenReadFromJson(c.read);
+  const root = fromHex(c.storeRoot);
+  const policy = { attester: fromHex(c.attester), scheme: c.scheme };
+  ok(gate(policy, fromHex(c.subject), read, root, c.nowRound).ok, "demo compliance gate passes");
+  ok(!gate(policy, fromHex(c.subject), read, root, c.expiredNowRound).ok, "gate refuses when expired");
+  ok(!gate({ attester: fromHex(c.otherAttester) }, fromHex(c.subject), read, root, c.nowRound).ok, "gate refuses wrong attester");
+  ok(decodeFlag(read.value)?.status === ComplianceStatus.Verified, "flag decodes to Verified");
+}
 
 console.log(`explorer logic: ${checks} checks passed`);
 void here;

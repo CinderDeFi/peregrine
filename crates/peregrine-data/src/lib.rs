@@ -15,7 +15,12 @@
 //!   and priced independently, with the 50/30/20 burn/validator/endowment
 //!   split from §5.2.
 
+pub mod compliance;
+pub mod disclosure;
+pub mod faucet;
 pub mod fees;
+#[cfg(feature = "streams")]
+pub mod feeds;
 pub mod merkle;
 #[cfg(feature = "streams")]
 pub mod sessions;
@@ -25,7 +30,18 @@ pub mod smt_v2;
 pub mod streams;
 pub mod tables;
 
+pub use compliance::{
+    cell_key, check_attestation, compliance_table, ComplianceAttestation, CompliancePolicy,
+    ComplianceStatus, SignedAttestation,
+};
+pub use disclosure::{FieldRow, SelectiveDisclosure};
+pub use faucet::{faucet_table, FaucetDrip, FaucetPolicy, SignedDrip};
 pub use fees::{DualMeter, FeeQuote, FeeSchedule, FeeSplit};
+#[cfg(feature = "streams")]
+pub use feeds::{
+    feed_latest_table, feed_source_table, feeds_table, Aggregation, FeedId, FeedKind,
+    FeedObservation, FeedPublisher, FeedRegistry, FeedSpec, FeedValue,
+};
 pub use merkle::{MerkleProof, MerkleTree};
 pub use smt::{SmtProof, SparseMerkleTree};
 #[cfg(feature = "streams")]

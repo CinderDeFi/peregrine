@@ -47,6 +47,17 @@ const data = {
   catalog,
 };
 
+// Selective-disclosure + compliance fixtures (real Rust proofs), so the explorer
+// can show a verified partial reveal and a compliance check offline.
+const selective = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../sdk/js/test/fixtures/selective.json", import.meta.url)), "utf8"),
+);
+data.disclosure = selective.disclosure;
+data.compliance = selective.compliance;
+
 writeFileSync(out, JSON.stringify(data, null, 2) + "\n");
-console.log(`wrote ${out}: ${data.snapshots.length} snapshots, ${catalog.length} catalog entries`);
+console.log(
+  `wrote ${out}: ${data.snapshots.length} snapshots, ${catalog.length} catalog entries, ` +
+    `+ disclosure & compliance`,
+);
 void dir;

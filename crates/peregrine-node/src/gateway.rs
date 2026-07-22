@@ -145,8 +145,8 @@ async fn dispatch(client: &Client, req: Value) -> Value {
 
         // Writes are intentionally not proxied: an explorer reads. Submitting
         // records or transactions is signing work that belongs in the CLI/SDK.
-        "publish" | "submitTx" | "submitClaim" | "openSession" | "sessionAction"
-        | "revokeSession" => err(format!(
+        "publish" | "submitTx" | "submitClaim" | "submitAttestation" | "openSession"
+        | "sessionAction" | "revokeSession" => err(format!(
             "the gateway is read-only; `{kind}` must go through the CLI or a native SDK client"
         )),
 

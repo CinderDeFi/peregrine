@@ -15,7 +15,7 @@
 **[peregrine-labs.github.io/peregrine](https://peregrine-labs.github.io/peregrine/)** — overview, benchmarks, and demo instructions.
 
 📋 **Reviewing this code?** Start with **[AUDIT.md](AUDIT.md)** — scope, trust
-boundaries, nineteen named invariants, a threat model, and a ranked list of what
+boundaries, twenty-three named invariants, a threat model, and a ranked list of what
 to attack first. One page on the idea: **[docs/PITCH.md](docs/PITCH.md)**.
 
 A data-native, real-time Layer-1. This repository is the **solo bootstrap
@@ -87,13 +87,17 @@ a grant, and consensus — not the agent's good behaviour — enforces the bound
 ```rust
 let grant = SessionBuilder::new(expires_at_round)   // a round, not a clock
     .allow_table(TableId::named("agent.notes"))     // everything starts closed
-    .allow_stream(feed)
-    .budget(50)                                    // total it may ever spend
-    .max_per_action(5)                             // and never this much at once
-    .sign(&principal, &agent_key.public());
+    .allow_streams(feed_spec.provider_streams())    // scope a whole feed at once
+    .budget(50)                                     // total it may ever spend
+    .max_per_action(5)                              // and never this much at once
+    .try_sign(&principal, &agent_key.public())?;    // refuses an unspendable grant
 
 client.open_session(grant).await?;
 ```
+
+`try_sign` rejects a grant that could never work — e.g. a budget with no
+per-action cap — with a clear error, instead of leaving the agent to discover at
+spend time that it can never pay.
 
 Then the agent buys a data feed. **One signature opens a subscription; after
 that, payment happens on the fast path** — one debit per committed record, no
@@ -101,29 +105,39 @@ further signatures, credited to the publisher in the same commit:
 
 ```rust
 let mut signer = SessionSigner::new(agent_key, session_id);
-client.session_action(signer.sign(Action::Subscribe {
-    stream: feed,
-    price_per_record: 2,
-})).await?;
+client.session_action(signer.subscribe(feed_stream, 2)).await?;   // one call
+// …later, the agent can prove its own remaining budget, not just be told it:
+if let Some(st) = client.read_session(session_id).await? {
+    println!("{} grains left, active: {}", st.remaining(), st.is_active(round));
+}
 ```
+
+`SessionSigner` also has `pay`, `unsubscribe`, and `write` — one call each, so an
+agent never hand-assembles an action or forgets a field.
 
 **The same flow in TypeScript**, so a browser or edge agent can hold its own
 session key:
 
 ```ts
-import { SessionBuilder, SessionSigner, sessionId, tableId } from "@peregrine/sdk";
+import {
+  SessionBuilder, SessionSigner, sessionId, tableId,
+  decodeSessionState, sessionRemaining,
+} from "@peregrine/sdk";
 
 const grant = new SessionBuilder(currentRound + 500n)   // a round, not a clock
   .allowTable(tableId("agent.notes"))
   .allowStream(priceFeed)
   .budget(50n)
   .maxPerAction(5n)
-  .sign(principalSecret, agentPublic);
+  .trySign(principalSecret, agentPublic);               // validates first
 
 const signer = new SessionSigner(agentSecret, sessionId(grant.grant));
-await client.sessionAction(signer.sign({
-  kind: "subscribe", stream: priceFeed, pricePerRecord: 2n,
-}));
+await client.sessionAction(signer.subscribe(priceFeed, 2n));   // ergonomic helper
+
+// Read the agent's own remaining budget with a proof, verified locally:
+const read = await client.proveRead(sessionsTable(), sessionIdHex);
+const st = read && decodeSessionState(read.value);
+if (st) console.log(`${sessionRemaining(st)} grains left`);
 ```
 
 Grants are signed over their **bincode** encoding, so TypeScript has to
@@ -177,6 +191,35 @@ gained a feature — the opposite of what a delegation should do.
 live in `sys.sessions` and balances in `sys.balances`, both materialized and
 provable like any other table — so an agent can *prove* what it is allowed to
 do rather than being told.
+
+#### Paying for verifiable data, end to end
+
+```bash
+peregrine sdk example agent-data    # an agent pays for an oracle feed
+```
+
+This is the whole point of the machinery: an agent subscribes to an
+[oracle feed](#oracle--verifiable-data-feeds), pays per price update on the fast
+path, and reads the **verified** `FeedValue` — value plus freshness — proven
+against the store root. Scope the session to the feed's sources in one call with
+`allow_streams(spec.provider_streams())`, and the agent pays only for that feed,
+only up to its budget, and proves its own balance at every step. When the budget
+runs out it stops paying and stops being owed data; the feed keeps updating.
+
+#### Budget & scope recipes
+
+Sessions start fully closed; open exactly what an agent needs. Common shapes:
+
+| Agent | Scope | Budget |
+|---|---|---|
+| **Feed consumer** | `allow_streams(feed.provider_streams())` | `budget(N)` · `max_per_action(price)` — the per-record price is the only spend, so cap it there |
+| **Trader / writer** | `allow_table(t)` | `budget(0)` — write-only needs no funds; `try_sign` accepts it |
+| **Multi-feed** | `allow_streams(a.provider_streams())` then `.allow_streams(b…)` | one budget across all feeds |
+
+Two rules keep an agent safe no matter the shape: **`max_per_action` bounds a
+single mistake**, and **`budget` bounds total loss** — a compromised session key
+can be wrong many times cheaply rather than once catastrophically. `try_sign`
+refuses the one combination that silently breaks (a budget with a zero cap).
 
 ### RWA contract templates
 
@@ -266,6 +309,26 @@ peregrine bench        # sustained throughput + latency percentiles
 peregrine --help       # every command
 ```
 
+### Run a testnet
+
+Stand up a reproducible network from a genesis file, with a rate-limited faucet:
+
+```bash
+peregrine genesis new --validators 4 --chain-id 424242 --network peregrine-testnet-1
+peregrine node run    --genesis genesis.toml --keys-dir testnet-keys --rpc-addr 127.0.0.1:9000
+peregrine gateway     --node 127.0.0.1:9000                 # public HTTP RPC for browsers/SDKs
+peregrine faucet serve --node 127.0.0.1:9000 --faucet-key testnet-keys/faucet.key
+peregrine faucet drip <your-hex-pubkey>                     # get testnet tokens
+```
+
+`genesis.toml` fixes the **chain id**, the **validator set** and stake, network
+parameters, the **faucet** authority + limits, and any initial allocations. The
+faucet's per-request / cooldown / lifetime limits are enforced **on-chain**, so
+no node can hand out more than genesis allows, and only the faucet key can drip.
+Full guide, including multi-host deployment, health checks, and connecting
+wallets: **[docs/TESTNET.md](docs/TESTNET.md)** (`scripts/testnet-local.sh`
+wraps the first two steps).
+
 ### Watch it live
 
 In a second terminal, point `watch` at a running node:
@@ -347,10 +410,10 @@ targets if you prefer.)
 ### Develop
 
 ```bash
-cargo test                                        # 222 tests, all crates
+cargo test                                        # 277 tests, all crates
 cargo test -p peregrine-interop --features bls    # + real BLS / mainnet fixtures
 cd contracts && forge test                        # EVM verifier (48 Foundry tests, incl. real Groth16 e2e)
-cd sdk/js && npm install && npm test              # TypeScript light client + sessions (60 tests)
+cd sdk/js && npm install && npm test              # TypeScript light client + sessions + disclosure/compliance/feeds/agent (82 tests)
 make ci                                           # everything CI runs
 ```
 
@@ -934,6 +997,131 @@ not implemented yet.** Use the Rust SDK to talk to a live node today. This is
 deliberately not a security gap: because `readVerified` re-checks locally, a
 gateway can withhold data but never forge it. Record signing and Talon
 encoding in TS are also still to do.
+
+## Selective disclosure & compliance
+
+Two privacy/compliance primitives, both verifiable against the same 32-byte
+store root a light client already trusts — no ZK circuits, no new trusted party.
+
+```bash
+peregrine sdk example compliance    # both, end to end, in ~1 second
+```
+
+### Selective disclosure — reveal one field, prove it, hide the rest
+
+A *disclosable* row is committed as a **binary-Merkle root over its fields**;
+that 32-byte `field_root` is the row's on-chain value, and the plaintext fields
+stay with the owner. To disclose, the owner sends an ordinary proven read of the
+commitment plus a Merkle path for each field it chooses to reveal:
+
+```text
+  store_root ──ProvenRead──▶ field_root ──field Merkle path──▶ field_i
+  (trusted)                  (on-chain)                        (revealed)
+```
+
+The verifier learns exactly the revealed fields — a KYC record can prove
+residency without exposing name or passport number — and a tampered field, a
+swapped index, or a foreign root all fail the check. Each field leaf binds its
+**index and the row's arity**, so fields can't be reordered or the count lied
+about. See [`peregrine-data::disclosure`](crates/peregrine-data/src/disclosure.rs);
+the TS verifier is [`sdk/js/src/disclosure.ts`](sdk/js/src/disclosure.ts).
+
+### Compliance hooks — attestations you choose to trust
+
+An **attester** (a KYC desk, a bank, a regulator) signs a
+`ComplianceAttestation` about an account; every validator verifies the signature
+on commit and materializes a compact flag into `sys.compliance`, keyed by
+`(subject, attester)`:
+
+```rust
+let att = AttestationBuilder::verified(issued_round, expires_round).sign(&bank, &alice);
+client.submit_attestation(att).await?;                 // signed, verified on commit
+// An institution requires a flag before accepting a transfer:
+node.compliant_credit(&alice, amount, &CompliancePolicy::new(bank.public()))?;
+```
+
+The design point: **there is no global KYC authority.** The chain records
+*signed* attestations; it does not decide which attesters are legitimate.
+"Require compliance" means require a valid, unexpired `Verified` attestation
+**from an attester you chose** — which is why the table is keyed by
+`(subject, attester)`, so a stranger's say-so simply lands in a cell you never
+read. Expiry is measured in committed **rounds**, never wall-clock, so every
+validator agrees on exactly when an attestation lapses.
+
+Enforcement comes two ways, both minimal-trust:
+
+* **on-chain** — `compliant_credit` consults committed state during commit, so a
+  gated transfer is refused deterministically on every validator;
+* **off-chain** — an auditor holding only the store root runs
+  `CompliancePolicy::gate` against a proven read of the cell. Absence is a hard
+  refusal, never a silent pass.
+
+See [`peregrine-data::compliance`](crates/peregrine-data/src/compliance.rs) and
+[`sdk/js/src/compliance.ts`](sdk/js/src/compliance.ts). The web explorer shows a
+verified disclosure and a compliance check when the demo data carries them.
+
+## Oracle & verifiable data feeds
+
+An oracle layer built *on top of* Streams and Tables, with no new trust
+assumptions: a feed value is committed table state, so every read is a proven
+read against the 32-byte store root. Price feeds, RWA/valuation data, and generic
+scalars all use the same path.
+
+```bash
+peregrine sdk example oracle    # a 3-source median feed + an RWA valuation
+```
+
+### The shape of a feed
+
+```text
+  providers ──sign observations──▶ Streams ──commit──▶ per-source cells
+                                                             │ aggregate the fresh ones
+                                                             ▼
+                                       sys.feed_latest[feed_id]  (value + round)
+```
+
+A **`FeedSpec`** names a channel, a value kind (`Price`/`Rwa`/`Generic`), its
+decimals, an aggregation rule (`Single`/`Median`), the authorised **providers**,
+and a staleness bound. Its identity is the **hash of the spec**, so a feed id
+commits to *who may publish* and *how it aggregates* — trusting a feed id
+transitively fixes its provider set. There is no registration authority:
+registering a feed is publishing its self-authenticating spec (`RegisterFeed` is
+permissionless and idempotent). Each provider publishes tiny
+**`FeedObservation`s** (`value + timestamp`) to its own stream, and only the
+named provider can sign them.
+
+### Materialization, aggregation, and freshness
+
+On commit, a provider's observation updates its per-source cell, then the node
+**re-aggregates only the fresh sources** into `sys.feed_latest[feed_id]`. A
+source that goes dark past the staleness bound is dropped from the median, so one
+lagging provider can't skew or freeze the value. The materialized cell carries
+the value, the round it was last updated, the decimals, and the source count —
+all in ≤32 bytes, so a contract that just wants the price reads the low 8 bytes,
+and a light client verifies the whole thing.
+
+### Reading a feed
+
+```rust
+// Rust: publish, then read the median latest — verified locally.
+let feed_id = client.register_feed(spec).await?;
+let mut src = FeedPublisher::new(&spec, provider_key);
+client.publish(src.observe(61_500_00)).await?;          // 2 decimals
+if let Some(fv) = client.read_feed(feed_id).await? {     // proof verified vs the root
+    println!("{} ({} sources, round {})", fv.as_f64(), fv.n_sources, fv.updated_round);
+}
+```
+
+```ts
+// TypeScript: verify a feed read against the store root and check freshness.
+const read = await client.proveRead(feedLatestTable(), feedIdHex);
+const fv = readFeedValue(read, storeRoot);               // null unless it verifies
+if (fv && isFresh(fv, currentRound, maxStaleness)) use(fv.value);
+```
+
+The trust surface is exactly the store root and the provider set the feed id
+commits to. See [`peregrine-data::feeds`](crates/peregrine-data/src/feeds.rs) and
+[`sdk/js/src/feeds.ts`](sdk/js/src/feeds.ts).
 
 ## Interoperability — verify, never trust
 

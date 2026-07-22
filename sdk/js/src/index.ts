@@ -33,6 +33,43 @@ export {
 } from "./verify.ts";
 
 export {
+  fieldLeafBytes,
+  selectiveDisclosureFromJson,
+  verifySelectiveDisclosure,
+  type FieldReveal,
+  type SelectiveDisclosure,
+  type SelectiveDisclosureJson,
+} from "./disclosure.ts";
+
+export {
+  cellKey,
+  ComplianceStatus,
+  complianceTable,
+  decodeFlag,
+  gate,
+  requireCompliant,
+  type CompliancePolicy,
+  type ComplianceResult,
+  type Flag,
+} from "./compliance.ts";
+
+export {
+  Aggregation,
+  decodeFeedValue,
+  decodeObservation,
+  encodeObservation,
+  feedKindName,
+  FeedKind,
+  feedLatestTable,
+  feedValueAsNumber,
+  isFresh,
+  readFeedValue,
+  staleness,
+  type FeedObservation,
+  type FeedValue,
+} from "./feeds.ts";
+
+export {
   bytesEqual,
   combine,
   digest,
@@ -57,13 +94,19 @@ export {
   signAction,
   signGrant,
   signRevocation,
+  decodeSessionState,
+  sessionRemaining,
+  isActive,
+  isSubscribed,
   type Action,
   type Id32,
   type Scope,
   type SessionAction,
   type SessionGrant,
+  type SessionState,
   type SignedAction,
   type SignedGrant,
+  type Subscription,
 } from "./sessions.ts";
 
-export { BincodeWriter, encode as bincodeEncode } from "./bincode.ts";
+export { BincodeReader, BincodeWriter, encode as bincodeEncode } from "./bincode.ts";

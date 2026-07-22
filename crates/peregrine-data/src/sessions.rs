@@ -152,6 +152,24 @@ impl SessionGrant {
     pub fn id(&self) -> Hash {
         Hash::digest(&self.signing_bytes())
     }
+
+    /// Catch a grant that is misconfigured in a way that makes it useless. A
+    /// budget with no per-action cap can never authorise a single payment (every
+    /// spend of a positive amount exceeds a zero cap), so a caller that funds a
+    /// session but forgets `max_per_action` has silently built a session that
+    /// can never pay. Surfacing that here turns a confusing runtime rejection
+    /// into a clear one before the grant is ever signed or submitted.
+    ///
+    /// A *scope-only* session (no budget, no cap) is valid — it just cannot
+    /// spend, which is exactly what a write-only agent wants.
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if self.budget_grains > 0 && self.scope.max_spend_per_action == 0 {
+            return Err(SessionError::UnspendableBudget {
+                budget: self.budget_grains,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A grant plus the principal's signature over it.
@@ -269,6 +287,31 @@ impl SessionState {
             .find(|(s, _)| s == stream)
             .map(|(_, p)| *p)
     }
+
+    /// Whether the session can still act at `round`: not revoked and not
+    /// expired. The same predicate `authorize` and `charge_subscription` apply,
+    /// exposed so an agent can check before it bothers signing.
+    pub fn is_active(&self, round: Round) -> bool {
+        !self.revoked && round <= self.grant.expires_at_round
+    }
+
+    /// Whether this session is currently paying for `stream`.
+    pub fn is_subscribed(&self, stream: &StreamId) -> bool {
+        self.price_for(stream).is_some()
+    }
+
+    /// Serialize the committed state — the exact bytes materialized into
+    /// `sys.sessions`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("session state serialize")
+    }
+
+    /// Decode committed state read from `sys.sessions`, so an agent (or anyone)
+    /// can **prove** what a session is allowed to do and how much it has left,
+    /// rather than being told. `None` if the bytes are not a session state.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        bincode::deserialize(bytes).ok()
+    }
 }
 
 /// Why an action was refused. Each variant is a distinct rule, so a rejection
@@ -299,6 +342,8 @@ pub enum SessionError {
     GrantAlreadyExpired { expires_at: Round, now: Round },
     #[error("only the principal may revoke")]
     NotPrincipal,
+    #[error("grant has a {budget}-grain budget but a per-action cap of 0 — it could never spend a grain; set max_per_action")]
+    UnspendableBudget { budget: Grains },
 }
 
 /// Validate a signed action against a session at `round`.
@@ -466,6 +511,13 @@ impl SessionBuilder {
         self
     }
 
+    /// Allow several streams at once — e.g. every source of a feed via
+    /// [`FeedSpec::provider_streams`](crate::feeds::FeedSpec::provider_streams).
+    pub fn allow_streams<I: IntoIterator<Item = StreamId>>(mut self, streams: I) -> Self {
+        self.scope.streams.extend(streams);
+        self
+    }
+
     /// Total spend across the session's whole life.
     pub fn budget(mut self, grains: Grains) -> Self {
         self.budget = grains;
@@ -484,19 +536,39 @@ impl SessionBuilder {
         self
     }
 
-    /// Sign the grant with the principal's key, delegating to `session_key`.
-    pub fn sign(self, principal: &peregrine_core::Keypair, session_key: &PublicKey) -> SignedGrant {
-        SignedGrant::new(
+    /// The unsigned grant this builder describes, for `session_key`.
+    pub fn build(&self, principal: PublicKey, session_key: PublicKey) -> SessionGrant {
+        SessionGrant {
             principal,
-            SessionGrant {
-                principal: principal.public(),
-                session_key: *session_key,
-                scope: self.scope,
-                budget_grains: self.budget,
-                expires_at_round: self.expires_at_round,
-                grant_nonce: self.grant_nonce,
-            },
-        )
+            session_key,
+            scope: self.scope.clone(),
+            budget_grains: self.budget,
+            expires_at_round: self.expires_at_round,
+            grant_nonce: self.grant_nonce,
+        }
+    }
+
+    /// Sign the grant with the principal's key, delegating to `session_key`.
+    ///
+    /// Infallible for backward compatibility; prefer [`try_sign`](Self::try_sign),
+    /// which first rejects a misconfigured grant (e.g. a budget with no
+    /// per-action cap) with a clear error instead of leaving the agent to
+    /// discover at spend time that it can never pay.
+    pub fn sign(self, principal: &peregrine_core::Keypair, session_key: &PublicKey) -> SignedGrant {
+        let grant = self.build(principal.public(), *session_key);
+        SignedGrant::new(principal, grant)
+    }
+
+    /// Validate the grant, then sign it. Returns [`SessionError::UnspendableBudget`]
+    /// for a funded session that could never spend.
+    pub fn try_sign(
+        self,
+        principal: &peregrine_core::Keypair,
+        session_key: &PublicKey,
+    ) -> Result<SignedGrant, SessionError> {
+        let grant = self.build(principal.public(), *session_key);
+        grant.validate()?;
+        Ok(SignedGrant::new(principal, grant))
     }
 }
 
@@ -523,6 +595,11 @@ impl SessionSigner {
         self.session_id
     }
 
+    /// The nonce the next signed action will carry.
+    pub fn next_nonce(&self) -> u64 {
+        self.next_nonce
+    }
+
     /// Sign the next action, advancing the nonce.
     pub fn sign(&mut self, action: Action) -> SignedAction {
         let signed = SignedAction::new(
@@ -535,6 +612,35 @@ impl SessionSigner {
         );
         self.next_nonce += 1;
         signed
+    }
+
+    // ── ergonomic action builders ────────────────────────────────────────────
+    // One call each, so an agent never hand-assembles an `Action` or forgets a
+    // field. All go through `sign`, so they share its nonce discipline.
+
+    /// Pay `amount` grains to `payee`.
+    pub fn pay(&mut self, payee: PublicKey, amount: Grains) -> SignedAction {
+        self.sign(Action::Pay { payee, amount })
+    }
+
+    /// Subscribe to `stream`, paying `price_per_record` per committed record
+    /// thereafter — the micropayment fast path, one signature for an ongoing
+    /// stream of debits.
+    pub fn subscribe(&mut self, stream: StreamId, price_per_record: Grains) -> SignedAction {
+        self.sign(Action::Subscribe {
+            stream,
+            price_per_record,
+        })
+    }
+
+    /// Stop paying for `stream`.
+    pub fn unsubscribe(&mut self, stream: StreamId) -> SignedAction {
+        self.sign(Action::Unsubscribe { stream })
+    }
+
+    /// Write `value` at `key` in `table` (must be in the session's scope).
+    pub fn write(&mut self, table: TableId, key: Vec<u8>, value: Vec<u8>) -> SignedAction {
+        self.sign(Action::Write { table, key, value })
     }
 
     /// Rewind after a rejected submission, so the next attempt reuses the
@@ -940,5 +1046,93 @@ mod tests {
         let mut st = session(&principal, &agent, 1000, 100);
         assert_eq!(charge_subscription(&mut st, &stream(), 1), None);
         assert_eq!(st.spent, 0);
+    }
+
+    // ── usability: validation, ergonomic signing, introspection ─────────────
+
+    #[test]
+    fn a_funded_session_with_no_per_action_cap_is_rejected() {
+        let (principal, agent) = keys();
+        // Budget but no per-action cap — it could never spend a grain.
+        let err = SessionBuilder::new(100)
+            .budget(1_000)
+            .try_sign(&principal, &agent.public())
+            .unwrap_err();
+        assert_eq!(err, SessionError::UnspendableBudget { budget: 1_000 });
+
+        // The same builder with a cap is fine.
+        assert!(SessionBuilder::new(100)
+            .budget(1_000)
+            .max_per_action(10)
+            .try_sign(&principal, &agent.public())
+            .is_ok());
+
+        // A scope-only (write-only) session with no budget is valid.
+        assert!(SessionBuilder::new(100)
+            .allow_table(table())
+            .try_sign(&principal, &agent.public())
+            .is_ok());
+    }
+
+    #[test]
+    fn signer_helpers_match_hand_built_actions() {
+        let (_, agent) = keys();
+        let id = Hash::digest(b"session");
+        // Two signers from the same key/id produce identical bytes for the same
+        // logical action — the helper is exactly `sign(Action::…)`.
+        let mut a = SessionSigner::new(Keypair::from_bytes(&agent.to_bytes()), id);
+        let mut b = SessionSigner::new(Keypair::from_bytes(&agent.to_bytes()), id);
+        let payee = keys().0.public();
+
+        let h1 = a.pay(payee, 5);
+        let h2 = b.sign(Action::Pay { payee, amount: 5 });
+        assert_eq!(h1.action, h2.action);
+        assert_eq!(h1.signature.0, h2.signature.0);
+        assert_eq!(a.next_nonce(), 1, "helper advances the nonce");
+
+        // Nonces keep advancing across mixed helpers.
+        let s = stream();
+        assert_eq!(a.subscribe(s, 2).action.nonce, 1);
+        assert_eq!(a.unsubscribe(s).action.nonce, 2);
+        assert_eq!(a.write(table(), b"k".to_vec(), b"v".to_vec()).action.nonce, 3);
+    }
+
+    #[test]
+    fn session_state_round_trips_and_reports_liveness() {
+        let (principal, agent) = keys();
+        let mut st = session(&principal, &agent, 1000, 50);
+        let s = stream();
+        st.subscriptions.push((s, 3));
+        st.spent = 120;
+
+        // Materialize → read back (the sys.sessions round trip).
+        let decoded = SessionState::from_bytes(&st.to_bytes()).expect("decodes");
+        assert_eq!(decoded, st);
+        assert_eq!(decoded.remaining(), 880);
+        assert!(decoded.is_subscribed(&s));
+        assert!(decoded.is_active(50), "expiry round is inclusive");
+        assert!(!decoded.is_active(51), "expired");
+
+        let mut revoked = st.clone();
+        revoked.revoked = true;
+        assert!(!revoked.is_active(1), "a revoked session is never active");
+        assert_eq!(SessionState::from_bytes(b"junk"), None);
+    }
+
+    #[test]
+    fn allow_streams_scopes_a_whole_set_at_once() {
+        let (principal, agent) = keys();
+        let streams: Vec<StreamId> = (0..3)
+            .map(|i| StreamId::derive(&format!("s{i}"), &agent.public()))
+            .collect();
+        let signed = SessionBuilder::new(100)
+            .allow_streams(streams.clone())
+            .max_per_action(10)
+            .budget(100)
+            .try_sign(&principal, &agent.public())
+            .unwrap();
+        for s in &streams {
+            assert!(signed.grant.scope.allows_stream(s));
+        }
     }
 }

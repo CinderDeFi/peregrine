@@ -50,6 +50,16 @@ pub enum RpcRequest {
         session_id: Hash,
         signature: Signature,
     },
+    /// Submit a KYC/AML attestation, signed by an attester. Like a claim it
+    /// carries its own authorisation (the attester's signature), which every
+    /// validator verifies during commit before the flag is materialized.
+    SubmitAttestation(Box<peregrine_data::compliance::SignedAttestation>),
+    /// Register an oracle feed. Permissionless — a spec is content-addressed, so
+    /// its id commits to its provider set and aggregation rule.
+    RegisterFeed(Box<peregrine_data::feeds::FeedSpec>),
+    /// A testnet faucet drip, signed by the faucet authority. The signature and
+    /// the per-recipient rate limits are enforced during commit.
+    FaucetDrip(Box<peregrine_data::faucet::SignedDrip>),
     /// Ask for a value plus an inclusion proof against the current store root.
     ProveRead { table: TableId, key: Vec<u8> },
     /// Ask for the node's current 32-byte store root.

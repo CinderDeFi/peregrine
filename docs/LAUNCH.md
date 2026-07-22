@@ -330,7 +330,7 @@ Some things that might interest this crowd:
   block hashes, real `eth_getProof` responses, a real 510/512 BLS aggregate.
 
 It is an unaudited scaffold: never deployed, holds no value, no token. There's
-an AUDIT.md with the scope, nineteen named invariants, a threat model, and a
+an AUDIT.md with the scope, twenty-three named invariants, a threat model, and a
 ranked list of what I'd attack first. The known-limitations section is longer
 than the pitch.
 
