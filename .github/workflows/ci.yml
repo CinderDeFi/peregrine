@@ -37,6 +37,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        # Backstop so a wedged test can never burn the whole job budget. The
+        # suite runs in a few minutes; this only trips on a genuine hang, and
+        # the individual tests (e.g. restart_recovery) fail fast well before it.
+        timeout-minutes: 15
         run: cargo test --workspace
 
       # The demo and the harness are load-bearing documentation: if they stop
