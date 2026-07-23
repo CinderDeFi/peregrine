@@ -129,6 +129,13 @@ pub enum Query {
     },
     /// The current 32-byte store root.
     StoreRoot { reply: oneshot::Sender<Hash> },
+    /// Committed-progress counters for *this* pipeline: `(commit_rounds,
+    /// committed_records)`. A live "how far has this node committed" probe —
+    /// used for diagnostics that need to tell a lagging node from a wedged one
+    /// without waiting for shutdown. Note the counters are per-pipeline and so
+    /// reset to zero on restart, which is exactly what makes them show a
+    /// *restarted* node's post-recovery progress rather than absolute height.
+    CommittedProgress { reply: oneshot::Sender<(u64, u64)> },
 }
 
 /// Serve one query from the pipeline. A dropped receiver (client gone) is fine.
@@ -139,6 +146,12 @@ fn handle_query(q: Query, pipeline: &mut ExecutionPipeline) {
         }
         Query::StoreRoot { reply } => {
             let _ = reply.send(pipeline.store_root());
+        }
+        Query::CommittedProgress { reply } => {
+            let _ = reply.send((
+                pipeline.metrics.commit_rounds,
+                pipeline.metrics.committed_records,
+            ));
         }
     }
 }

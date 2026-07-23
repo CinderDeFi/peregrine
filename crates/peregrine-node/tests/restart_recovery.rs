@@ -54,7 +54,16 @@ const RESTART: u16 = 2; // validator we kill and bring back
 /// not a performance assertion — it is the point at which we stop believing the
 /// system is merely slow. Overshooting costs nothing on a healthy run because
 /// the polls exit as soon as the condition holds.
-const CONDITION_TIMEOUT: Duration = Duration::from_secs(90);
+///
+/// Raised from 90s to 180s after a CI flake: the restarted node was still
+/// catching up (a real, load-sensitive lag — the store roots were converging,
+/// not forked) when the old deadline fired. The fix is to give the genuine
+/// convergence more headroom under a loaded box, not to weaken the assertion or
+/// sleep blindly; the poll still exits the instant the roots actually agree, so
+/// a healthy run is unaffected. On timeout the test now dumps every node's root
+/// and committed height (see [`diagnose`]) so lag and a true fork stay
+/// distinguishable without a rerun.
+const CONDITION_TIMEOUT: Duration = Duration::from_secs(180);
 /// Gap between polls. Short enough to keep a healthy run brisk, long enough not
 /// to add meaningful load to the thing being measured.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -130,6 +139,20 @@ async fn has_key(q: &mpsc::Sender<Query>, table: TableId, key: &[u8]) -> bool {
     )
 }
 
+/// Ask a running validator for its committed progress: `(commit_rounds,
+/// committed_records)`. `None` means it did not answer (shutting down or wedged).
+/// These counters reset on restart, so for the restarted node they report
+/// post-recovery progress — a zero here at timeout means it never rejoined,
+/// which is precisely what a diagnostic must distinguish from mere lag.
+async fn committed_progress(q: &mpsc::Sender<Query>) -> Option<(u64, u64)> {
+    let (tx, rx) = oneshot::channel();
+    q.send(Query::CommittedProgress { reply: tx }).await.ok()?;
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .ok()?
+        .ok()
+}
+
 /// Poll `cond` until it returns true, or fail with `what` after the timeout.
 async fn wait_for<F, Fut>(what: &str, mut cond: F)
 where
@@ -144,6 +167,48 @@ where
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     panic!("timed out after {CONDITION_TIMEOUT:?} waiting for: {what}");
+}
+
+/// Like [`wait_for`], but on timeout runs `diag` and appends its snapshot to the
+/// panic message. Used for convergence, where knowing *where every node was*
+/// (root + committed height) is what tells a load-induced lag apart from a real
+/// fork — the whole reason this test polls a condition instead of sleeping.
+async fn wait_for_or_dump<F, Fut, D, DFut>(what: &str, mut cond: F, diag: D)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+    D: Fn() -> DFut,
+    DFut: std::future::Future<Output = String>,
+{
+    let deadline = Instant::now() + CONDITION_TIMEOUT;
+    while Instant::now() < deadline {
+        if cond().await {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let snapshot = diag().await;
+    panic!("timed out after {CONDITION_TIMEOUT:?} waiting for: {what}\nfinal state:\n{snapshot}");
+}
+
+/// A per-node snapshot — store root and committed height — printed when
+/// convergence times out. A set of differing-but-advancing roots reads as lag;
+/// a stuck root (or a restarted node still at height 0) reads as a real problem.
+async fn diagnose(nodes: &[Node]) -> String {
+    let mut lines = Vec::with_capacity(nodes.len());
+    for (i, n) in nodes.iter().enumerate() {
+        let id = ValidatorId(i as u16);
+        let root = match store_root(&n.query).await {
+            Some(h) => h.short(),
+            None => "<no answer>".to_string(),
+        };
+        let height = match committed_progress(&n.query).await {
+            Some((rounds, records)) => format!("height={rounds} records={records}"),
+            None => "height=<no answer>".to_string(),
+        };
+        lines.push(format!("  {id:?}: root={root} {height}"));
+    }
+    lines.join("\n")
 }
 
 /// Collect every live validator's root, for convergence checks and diagnostics.
@@ -331,8 +396,10 @@ async fn crashed_validator_recovers_from_disk() {
     // **The fix.** Poll until all four nodes report the same non-zero root,
     // rather than sleeping and hoping. A node that is merely behind converges
     // and the test proceeds immediately; a node that has genuinely forked never
-    // converges and the timeout prints every root.
-    wait_for(
+    // converges and the timeout dumps every node's root and committed height so
+    // lag (roots differ but heights climb) and a true fork (a stuck root) are
+    // told apart from the failure message alone.
+    wait_for_or_dump(
         "all four validators to converge on one store root",
         || async {
             let rs = roots(&nodes).await;
@@ -341,6 +408,7 @@ async fn crashed_validator_recovers_from_disk() {
             };
             first != Hash::ZERO && rs.iter().all(|(_, r)| *r == Some(first))
         },
+        || diagnose(&nodes),
     )
     .await;
 
