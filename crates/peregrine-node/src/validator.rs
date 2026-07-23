@@ -17,6 +17,24 @@
 //! hashes. Peers answer from their DAG with [`NetMessage::SyncResponse`];
 //! delivered ancestors may unblock parked vertices and, if they in turn
 //! have gaps, trigger a deeper fetch — each hash is requested at most once.
+//!
+//! ## Restart liveness (why a stalled node re-announces)
+//! Proposal is message-driven, so a validator that holds no *new* vertex has
+//! nothing to react to. After a whole committee is stopped and restarted from
+//! disk that is exactly the state every node is in: each one stopped at the
+//! moment it was waiting for a peer's next vertex, and on reload nobody
+//! re-sends anything, so no node ever receives the vertex that would let it
+//! propose. The mesh is up, the DAG is intact, and consensus is wedged.
+//!
+//! [`STALL_ANNOUNCE`] closes that hole. When nothing has changed for that long
+//! — no vertex inserted, no round proposed — the node re-broadcasts *its own
+//! tip* and re-asks for the ancestors of anything still parked. A peer that
+//! already holds the tip drops it (insertion is idempotent); a peer that was
+//! waiting for it advances; a peer that is further behind sees missing parents
+//! and starts a normal ancestor fetch. One side making progress is enough to
+//! restart the other, so the mesh always unwedges from a symmetric stall.
+//! This is also the retry path for a sync request lost with a dropped
+//! connection, which the request-once dedup would otherwise strand forever.
 
 use crate::network::{Broadcaster, Inbox, NetMessage};
 use crate::payload::WirePayload;
@@ -49,6 +67,21 @@ const LEADER_WAIT: Duration = Duration::from_millis(4);
 /// while bounding how much a restart must re-sync from peers to a small commit
 /// suffix. This is the "flush every N commits" durability/throughput knob.
 const FLUSH_EVERY_N_COMMITS: u64 = 16;
+
+/// How long a validator may make **no** progress at all — no vertex inserted,
+/// no round proposed — before it re-announces its tip and re-asks for the
+/// ancestors it is parked on (see the module docs).
+///
+/// This is a stall backstop, not a pacemaker: a healthy node proposes on every
+/// quorum and so resets the timer far faster than this, meaning the announce
+/// never fires in steady state. Half a second keeps restart recovery inside
+/// "a few seconds" while costing at most two idempotent frames per second per
+/// peer when a node really is stuck.
+const STALL_ANNOUNCE: Duration = Duration::from_millis(500);
+
+/// Log a *continuing* stall this often (every Nth announce, ≈5s) so a genuinely
+/// unreachable peer is visible at `info` without flooding the log.
+const STALL_LOG_EVERY: u64 = 10;
 
 /// What a validator task hands back when the simulation stops.
 pub struct NodeReport {
@@ -193,6 +226,18 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
                         commits = committer.commits,
                         "restored from disk"
                     );
+                    // Re-announce our tip immediately rather than waiting for
+                    // the first stall to expire. A gracefully-stopped node
+                    // stops *precisely* where it was waiting for a peer's next
+                    // vertex, so on a whole-committee restart every node is
+                    // waiting on every other and nothing would ever be sent.
+                    // Broadcasting the tip we resumed from is what gives peers
+                    // something to react to (see the module docs). Queued
+                    // frames wait in the per-peer outbound queue, so this also
+                    // works when the peer host comes up minutes later.
+                    if let Some(tip) = dag.latest_by(cfg.id).cloned() {
+                        cfg.net.broadcast(NetMessage::Vertex(tip)).await;
+                    }
                 }
                 // Snapshot held no vertex of ours (degenerate) — propose genesis.
                 None => {
@@ -230,6 +275,12 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
     let mut pacemaker = tokio::time::interval(Duration::from_millis(100));
     pacemaker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Restart/stall liveness (see module docs). `last_progress` is reset by any
+    // real change — a vertex entering the DAG or a round proposed — so the
+    // announce below only fires when the loop is genuinely wedged.
+    let mut last_progress = Instant::now();
+    let mut stall_announces = 0u64;
+
     loop {
         tokio::select! {
             biased;
@@ -264,6 +315,11 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
                 if let Some(q) = maybe { handle_query(q, &mut pipeline); }
             }
         }
+
+        // Where we stood on waking, so we can tell at the bottom of the
+        // iteration whether this wake achieved anything.
+        let dag_len_at_wake = dag.len();
+        let round_at_wake = next_round_to_propose;
 
         // Drain any other queued queries so a burst of client reads is served
         // in this wake rather than one per loop iteration.
@@ -349,6 +405,18 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
         // include the previous round's anchor so we don't needlessly skip an
         // honest leader (see LEADER_WAIT).
         loop {
+            // Never author a second vertex for a round we already hold one of
+            // our own at. After an *ungraceful* stop our resume point can trail
+            // vertices we broadcast but had not yet flushed; catch-up sync then
+            // hands them back to us, and proposing again at those rounds would
+            // be self-equivocation — which peers punish by rejecting *both*
+            // vertices. Adopting what the DAG already holds is the fail-closed
+            // choice, and it is what makes `systemctl restart` on a busy node
+            // safe rather than merely usually-safe.
+            while dag.has_vertex_by(cfg.id, next_round_to_propose) {
+                next_round_to_propose += 1;
+            }
+
             let prev = next_round_to_propose - 1;
             if dag.round_stake(prev) < dag.committee().quorum_threshold() {
                 // Not enough of round `prev` to build on yet — this is a
@@ -411,6 +479,34 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
             buffer_insert(&mut dag, &mut pending, vertex.clone());
             committer.try_commit(&dag, &mut pipeline);
             cfg.net.broadcast(NetMessage::Vertex(vertex)).await;
+        }
+
+        // Restart/stall liveness. "Progress" is deliberately broad — any vertex
+        // entering the DAG counts, so a node grinding through a deep catch-up
+        // sync is never mistaken for a wedged one.
+        if dag.len() != dag_len_at_wake || next_round_to_propose != round_at_wake {
+            if stall_announces > 0 {
+                tracing::info!(
+                    id = ?cfg.id,
+                    round = next_round_to_propose,
+                    after_announces = stall_announces,
+                    "consensus progress resumed"
+                );
+                stall_announces = 0;
+            }
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= STALL_ANNOUNCE {
+            stall_announces += 1;
+            sync_requests_sent += announce_tip(
+                &cfg.net,
+                cfg.id,
+                cfg.committee.size(),
+                &dag,
+                &pending,
+                stall_announces,
+            )
+            .await;
+            last_progress = Instant::now();
         }
 
         // Periodic durability: persist once the commit cursor has advanced by
@@ -528,6 +624,91 @@ async fn wait_until(deadline: Option<(Round, Instant)>) {
         Some((_, d)) => tokio::time::sleep_until(d).await,
         None => std::future::pending::<()>().await,
     }
+}
+
+/// Break a stall: re-broadcast our own tip and re-ask every peer for the
+/// ancestors we are still parked on. Returns how many sync requests it sent.
+///
+/// Two distinct hangs are repaired here, and both look identical from outside
+/// (idle CPU, live RPC, no new commits):
+///
+/// * **Symmetric wait.** Every node stopped where it was waiting for a peer's
+///   next vertex, so on restart no node has anything to react to. Re-sending
+///   our tip gives peers the vertex they are blocked on, or — if they are
+///   further behind — a vertex with parents they lack, which starts a normal
+///   ancestor fetch.
+/// * **A lost fetch.** [`request_missing`] asks for each hash at most once, so
+///   a request (or its answer) dropped with a broken connection strands
+///   recovery permanently. Re-asking here is the retry, and it goes to *every*
+///   peer rather than just the vertex's author, because after a restart the
+///   author may be the node that is still down while another peer holds the
+///   same ancestors.
+///
+/// Re-announcing is safe to repeat: [`Dag::insert`] is idempotent for a vertex
+/// already held, so a peer that needs nothing does nothing.
+async fn announce_tip(
+    net: &Broadcaster,
+    me: ValidatorId,
+    committee_size: usize,
+    dag: &Dag,
+    pending: &VecDeque<Vertex>,
+    nth: u64,
+) -> u64 {
+    let Some(tip) = dag.latest_by(me).cloned() else {
+        return 0; // no vertex of our own yet — nothing to announce
+    };
+    // First stall, then every STALL_LOG_EVERY, at info: a wedged mesh must be
+    // visible at the default log level. The testnet hang that motivated this
+    // was silent because every diagnostic here was `debug`.
+    if nth == 1 || nth.is_multiple_of(STALL_LOG_EVERY) {
+        tracing::info!(
+            id = ?me,
+            tip_round = tip.header.round,
+            parked = pending.len(),
+            attempt = nth,
+            "no consensus progress — re-announcing tip and re-requesting ancestors \
+             (peer restarted, unreachable, or a vertex was dropped)"
+        );
+    }
+    net.broadcast(NetMessage::Vertex(tip)).await;
+
+    // Everything the parked vertices are still waiting on, deduped and bounded.
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut want: Vec<Hash> = Vec::new();
+    for v in pending.iter() {
+        for h in dag.missing_parents(v) {
+            if seen.insert(h) {
+                want.push(h);
+                if want.len() >= MAX_SYNC_BATCH {
+                    break;
+                }
+            }
+        }
+        if want.len() >= MAX_SYNC_BATCH {
+            break;
+        }
+    }
+    if want.is_empty() {
+        return 0;
+    }
+
+    let mut sent = 0;
+    for j in 0..committee_size {
+        let to = ValidatorId(j as u16);
+        if to == me {
+            continue;
+        }
+        net.send_to(
+            to,
+            NetMessage::SyncRequest {
+                from: me,
+                want: want.clone(),
+            },
+        )
+        .await;
+        sent += 1;
+    }
+    sent
 }
 
 /// Send a sync request for parent hashes we haven't requested before.

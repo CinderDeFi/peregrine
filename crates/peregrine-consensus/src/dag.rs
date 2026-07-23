@@ -229,6 +229,31 @@ impl Dag {
         self.by_round.keys().next_back().copied().unwrap_or(0)
     }
 
+    /// The highest-round vertex authored by `id` that we currently hold.
+    ///
+    /// A node's *own* tip is what it re-announces when the mesh has gone quiet
+    /// (see the restart-liveness backstop in `validator.rs`): peers that are
+    /// waiting on exactly that vertex learn it, and peers that are further
+    /// behind discover the gap through its parents. Walking rounds downward
+    /// stops at the first hit, which for our own tip is the top of the DAG.
+    pub fn latest_by(&self, id: ValidatorId) -> Option<&Vertex> {
+        self.by_round
+            .iter()
+            .rev()
+            .find_map(|(_, authors)| authors.get(&id))
+            .and_then(|h| self.vertices.get(h))
+    }
+
+    /// True if we already hold a vertex authored by `id` at `round`. The
+    /// proposal path checks this so a node never authors a *second* vertex for
+    /// a round it has re-learned one of its own vertices for.
+    pub fn has_vertex_by(&self, id: ValidatorId, round: Round) -> bool {
+        self.by_round
+            .get(&round)
+            .map(|authors| authors.contains_key(&id))
+            .unwrap_or(false)
+    }
+
     /// Parent hashes of `vertex` that we do NOT yet hold locally — the set a
     /// validator asks its peers for during ancestor fetch.
     pub fn missing_parents(&self, vertex: &Vertex) -> Vec<Hash> {
@@ -314,6 +339,46 @@ mod tests {
                 }
             ),
             "expected NonLayeredParent, got {err:?}"
+        );
+    }
+
+    /// The two accessors the restart path leans on: `latest_by` finds the vertex
+    /// a stalled node re-announces, and `has_vertex_by` is the guard that stops
+    /// it authoring a second vertex for a round it re-learned one of its own at
+    /// (self-equivocation after an ungraceful stop).
+    #[test]
+    fn own_tip_lookup_and_duplicate_round_guard() {
+        let mut rng = rand::rngs::OsRng;
+        let keys: Vec<Keypair> = (0..4).map(|_| Keypair::generate(&mut rng)).collect();
+        let mut dag = Dag::new(committee(&keys), vec![]);
+        let me = ValidatorId(1);
+
+        assert!(dag.latest_by(me).is_none(), "no vertices yet");
+        assert!(!dag.has_vertex_by(me, 0));
+
+        let mut r0: Vec<Hash> = Vec::new();
+        for (i, kp) in keys.iter().enumerate() {
+            let v = Vertex::new_signed(kp, ValidatorId(i as u16), 0, vec![], Payload::default());
+            r0.push(dag.insert(v).expect("genesis"));
+        }
+        assert_eq!(dag.latest_by(me).expect("tip").header.round, 0);
+        assert!(dag.has_vertex_by(me, 0));
+        assert!(!dag.has_vertex_by(me, 1));
+
+        // Only *some* authors advance to round 1 — `latest_by` must report each
+        // author's own highest round, not the DAG's.
+        for (i, kp) in keys.iter().enumerate().take(3) {
+            let v =
+                Vertex::new_signed(kp, ValidatorId(i as u16), 1, r0.clone(), Payload::default());
+            dag.insert(v).expect("round 1");
+        }
+        assert_eq!(dag.latest_by(me).expect("tip").header.round, 1);
+        assert_eq!(dag.latest_by(me).expect("tip").header.author, me);
+        assert!(dag.has_vertex_by(me, 1));
+        assert_eq!(
+            dag.latest_by(ValidatorId(3)).expect("tip").header.round,
+            0,
+            "an author that did not advance still reports its own tip"
         );
     }
 

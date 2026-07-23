@@ -56,6 +56,13 @@ const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
 
+/// Repeat the "still cannot reach peer" line every Nth failed dial. At the
+/// capped backoff that is roughly every 30s — enough to make an unreachable
+/// peer obvious in `journalctl` without burying everything else. Peering
+/// failures must be visible at `info`: a silent redial loop is why an
+/// unreachable peer on the testnet was indistinguishable from a consensus hang.
+const DIAL_LOG_EVERY: u64 = 15;
+
 // ─────────────────────────────── TLS (dev) ──────────────────────────────────
 
 mod insecure_tls {
@@ -186,10 +193,17 @@ async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<Vec<u8>>> {
 async fn accept_loop(endpoint: Endpoint, inbox_tx: mpsc::UnboundedSender<NetMessage>) {
     while let Some(incoming) = endpoint.accept().await {
         let tx = inbox_tx.clone();
+        let from = incoming.remote_address();
         tokio::spawn(async move {
             match incoming.await {
-                Ok(conn) => reader_conn(conn, tx).await,
-                Err(e) => tracing::debug!("inbound handshake failed: {e}"),
+                Ok(conn) => {
+                    tracing::info!(peer = %from, "inbound QUIC session accepted");
+                    reader_conn(conn, tx).await;
+                }
+                // Info, not debug: a handshake that keeps failing (wrong port,
+                // a middlebox eating UDP) is an operator problem, and it must
+                // not be invisible at the default log level.
+                Err(e) => tracing::info!(peer = %from, "inbound handshake failed: {e}"),
             }
         });
     }
@@ -197,10 +211,11 @@ async fn accept_loop(endpoint: Endpoint, inbox_tx: mpsc::UnboundedSender<NetMess
 
 /// Read framed messages from one connection's single uni-stream into the inbox.
 async fn reader_conn(conn: Connection, inbox_tx: mpsc::UnboundedSender<NetMessage>) {
+    let peer = conn.remote_address();
     let mut recv = match conn.accept_uni().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!("accept_uni failed: {e}");
+            tracing::info!(peer = %peer, "inbound stream never opened: {e}");
             return;
         }
     };
@@ -214,9 +229,12 @@ async fn reader_conn(conn: Connection, inbox_tx: mpsc::UnboundedSender<NetMessag
                 }
                 Err(e) => tracing::warn!("undecodable frame ({} bytes): {e}", bytes.len()),
             },
-            Ok(None) => return,
+            Ok(None) => {
+                tracing::info!(peer = %peer, "inbound QUIC session closed cleanly");
+                return;
+            }
             Err(e) => {
-                tracing::debug!("read error, closing reader: {e}");
+                tracing::info!(peer = %peer, "inbound QUIC session ended: {e}");
                 return;
             }
         }
@@ -233,29 +251,43 @@ async fn writer_task(
 ) {
     let mut backoff = DIAL_BACKOFF_START;
     let mut pending: Option<Vec<u8>> = None;
+    // Consecutive failed dials since the link was last up. Drives both the
+    // backoff and the rate-limited "cannot reach peer" reporting.
+    let mut failures = 0u64;
     loop {
-        let conn = match endpoint.connect(peer, "localhost") {
-            Ok(connecting) => match connecting.await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!("dial {peer} failed: {e}");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(DIAL_BACKOFF_MAX);
-                    continue;
+        let conn = match dial(&endpoint, peer).await {
+            Some(c) => c,
+            None => {
+                failures += 1;
+                if failures == 1 || failures.is_multiple_of(DIAL_LOG_EVERY) {
+                    tracing::info!(
+                        peer = %peer,
+                        failed_dials = failures,
+                        retry_in = ?backoff,
+                        "peer unreachable — still redialing"
+                    );
                 }
-            },
-            Err(e) => {
-                tracing::debug!("dial setup {peer} failed: {e}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(DIAL_BACKOFF_MAX);
                 continue;
             }
         };
+        tracing::info!(
+            peer = %peer,
+            after_failed_dials = failures,
+            "outbound QUIC session established"
+        );
+        failures = 0;
         backoff = DIAL_BACKOFF_START;
         let mut send = match conn.open_uni().await {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!("open_uni {peer} failed: {e}");
+                // Back off here too: without it a peer that accepts the
+                // handshake but refuses streams spins this task on a tight
+                // dial loop.
+                tracing::info!(peer = %peer, "opening outbound stream failed: {e}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(DIAL_BACKOFF_MAX);
                 continue; // reconnect
             }
         };
@@ -279,10 +311,32 @@ async fn writer_task(
                     }
                 },
             };
-            if write_frame(&mut send, &frame).await.is_err() {
+            if let Err(e) = write_frame(&mut send, &frame).await {
+                tracing::info!(
+                    peer = %peer,
+                    "outbound QUIC session dropped ({e}); redialing, holding 1 frame for resend"
+                );
                 pending = Some(frame); // resend after reconnect
                 break;
             }
+        }
+    }
+}
+
+/// One dial attempt. `None` on any failure — the caller owns backoff and
+/// reporting so the two failure modes (setup vs handshake) stay one code path.
+async fn dial(endpoint: &Endpoint, peer: SocketAddr) -> Option<Connection> {
+    match endpoint.connect(peer, "localhost") {
+        Ok(connecting) => match connecting.await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::debug!("dial {peer} failed: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!("dial setup {peer} failed: {e}");
+            None
         }
     }
 }
@@ -357,6 +411,10 @@ fn wire_node(
             senders.push(inbox_tx.clone()); // self: local loopback
             continue;
         }
+        // Info: the dial targets are the single most useful thing to confirm
+        // when a mesh will not form, and they are cheap — one line per peer,
+        // once, at startup.
+        tracing::info!(id = ?id, listen = %addr, peer = %paddr, index = j, "dialing mesh peer");
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         senders.push(out_tx);
         tasks.push(tokio::spawn(writer_task(endpoint.clone(), paddr, out_rx)));

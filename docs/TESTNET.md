@@ -165,6 +165,62 @@ That's the whole deployment: **one `genesis.toml`, three key files, three start
 commands.** No peer-discovery protocol — the peer list is explicit, which is the
 honest choice for a coordinated testnet.
 
+### Restarting validators (never wipe)
+
+**Stop the nodes and start them again with the same `--storage` — that is the
+whole procedure.** Wiping storage is not a recovery step; if a restart doesn't
+resume, that is a bug worth reporting, not a reason to reach for `rm -rf`.
+
+Restarting the *entire* committee is supported, in any order, with any gap
+between servers. Each node reloads its DAG and table state, re-announces its own
+tip so peers that were waiting on it can move, and keeps redialing until the
+mesh is back. Expect rounds to resume within a few seconds of the last server
+coming up.
+
+To verify a restart actually worked, on each host:
+
+```bash
+# 1. Before stopping: note the value and the store root.
+peregrine read demo.table hello --rpc-addr 127.0.0.1:9000
+
+# 2. Stop both nodes (Ctrl-C, or `systemctl stop peregrine`). A graceful stop
+#    flushes a final snapshot; expect "shutting down…" and a commit summary.
+
+# 3. Start both again with the *same* flags — same --storage, same --listen,
+#    same --peers. Each log should show, at info:
+#      restored from disk   … resume_round=<n> dag=<n> commits=<n>
+#      dialing mesh peer    … peer=<other-ip>:9001
+#      outbound QUIC session established   peer=<other-ip>:9001
+#      inbound QUIC session accepted       peer=<other-ip>:<port>
+#    While the second host is still down the first logs, twice a second:
+#      no consensus progress — re-announcing tip and re-requesting ancestors
+#    plus, once each dial has actually timed out (tens of seconds if the
+#    packets are being dropped rather than refused):
+#      peer unreachable — still redialing   peer=… failed_dials=…
+#    Both stop once the peer is up; a "consensus progress resumed" line
+#    confirms it. A real run looks like this:
+#      10:48:44  restored from disk  id=v0 resume_round=10922 dag=21843
+#      10:48:44  no consensus progress …  tip_round=10921 attempt=1
+#      10:48:49  inbound QUIC session accepted  peer=…
+#      10:48:50  outbound QUIC session established  peer=…
+#      10:48:50  consensus progress resumed  id=v0 round=10924 after_announces=11
+
+# 4. Commit something new and read it back on BOTH hosts.
+peregrine submit-tx demo.table hello 12345 --rpc-addr 127.0.0.1:9000
+peregrine read      demo.table hello       --rpc-addr 127.0.0.1:9000   # host A
+peregrine read      demo.table hello       --rpc-addr 127.0.0.1:9000   # host B
+```
+
+Both hosts must return the same value **and** the same store root, with the
+proof verifying. If `submit-tx` never commits, the log lines above tell you
+which half is wrong: no `outbound QUIC session established` is a network or
+firewall problem (check `--peers` addresses, committee-index order, and that
+UDP `9001` is open in *both* directions); sessions established but a repeating
+`no consensus progress` line is a consensus problem.
+
+The `restart_mesh` integration test runs this exact sequence — stop both,
+restart one, restart the other late, commit — against a 2-validator committee.
+
 > The dev transport still uses self-signed TLS with verification skipped; every
 > vertex is independently signature-checked by consensus, so an unauthenticated
 > link can waste bandwidth but cannot forge blocks. Binding validator identity

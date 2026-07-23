@@ -618,6 +618,42 @@ tables, each holding one bincode blob:
   `highest_own_round + 1`, so it never re-issues a round a peer already
   accepted from it (self-equivocation).
 
+**Restarting without a wipe is supported — including restarting the whole
+committee.** Stopping every node and starting them all again from their
+existing `--storage` directories resumes the chain; no data wipe is required,
+and none should ever be used as a recovery step. Two mechanisms make that work:
+
+* **Peers redial forever.** Each per-peer writer task keeps retrying with
+  backoff (capped at 2s) and queues outbound frames while the link is down, so
+  the servers can be restarted in any order, minutes apart. Every session
+  established, lost, or refused is logged at `info`.
+* **A stalled node re-announces its tip.** Proposal is message-driven, so a
+  gracefully stopped node freezes exactly where it was *waiting for a peer's
+  next vertex*. After a whole-committee restart every node is in that state, and
+  if nobody re-sends anything nobody ever receives the vertex it is blocked on —
+  the mesh is up, RPC answers, and consensus never advances. So a node
+  re-broadcasts its own tip on restore, and again whenever nothing at all has
+  changed for 500 ms, re-asking every peer for the ancestors it is parked on.
+  Re-insertion is idempotent, so a peer that needs nothing does nothing; a peer
+  that was blocked advances; a peer that is further behind sees missing parents
+  and starts an ordinary ancestor fetch. That same retry is what recovers a sync
+  request lost with a dropped connection, which the request-once dedup would
+  otherwise strand forever.
+
+Proposing also skips any round the DAG already holds one of *our own* vertices
+at. After an ungraceful stop the resume point can trail vertices we broadcast
+but had not flushed; catch-up sync hands them back, and re-proposing those
+rounds would be self-equivocation — which peers punish by rejecting both
+vertices. Adopting what the DAG already holds is the fail-closed choice.
+
+The `restart_mesh` test pins all of this: a 2-validator committee (where the
+quorum threshold is the whole committee, so the deadlock is deterministic rather
+than a race) commits a write, both nodes stop gracefully, node 0 restarts alone
+and sits peerless for two seconds, node 1 arrives late, and a *new* transaction
+must then commit on both with matching roots and the pre-restart write intact.
+Without the tip re-announce it times out — which is exactly what the two-host
+testnet did.
+
 The `restart_recovery` test kills one of four validators, keeps the survivors
 committing, restarts the dead node from disk, and asserts it re-syncs the gap
 it missed and converges to the identical store root — including a Talon VM
@@ -652,7 +688,14 @@ does, so the consensus loop is untouched — only the wiring changes.
   heal with no coordination. The writer *holds the un-acked frame and resends
   it after reconnect*, so a dropped link never silently loses a sync request —
   which, because the fetch layer dedups by hash, would otherwise strand
-  recovery.
+  recovery. Frames that were already written when a connection died are not
+  recoverable at this layer; the consensus loop's stall re-announce (above) is
+  what covers that case.
+* **Peering is visible at `info`.** Dial targets at startup, every session
+  established or lost in either direction, and a rate-limited "peer unreachable
+  — still redialing" line. A silent redial loop is why an unreachable peer on
+  the testnet was indistinguishable from a consensus hang; run with
+  `RUST_LOG=info` (the default for the CLI) and the difference is one line.
 
 ### Benchmark results
 
