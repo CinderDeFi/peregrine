@@ -162,7 +162,7 @@ impl FeedSpec {
     /// is independent of the order they were listed in.
     fn canonical(&self) -> Vec<u8> {
         let mut providers = self.providers.clone();
-        providers.sort_by(|a, b| a.0.cmp(&b.0));
+        providers.sort_by_key(|p| p.0);
         let canon = (
             &self.channel,
             self.kind.code(),

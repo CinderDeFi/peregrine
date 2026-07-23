@@ -34,7 +34,8 @@ for oversights. Each is also called out in the README.
 
 | Component | What is unsafe | Consequence |
 | --- | --- | --- |
-| **TLS** (validator mesh + RPC) | Self-signed certs, verification disabled | Transport is unauthenticated. Consensus still signature-checks every vertex, so blocks can't be forged — but bandwidth can be wasted. |
+| **TLS** (validator mesh + RPC) | Self-signed certs, verification disabled | Transport is unauthenticated. Consensus still signature-checks every vertex, so blocks can't be forged — but bandwidth can be wasted. Binding validator identity into the mesh certificate is a production follow-up. |
+| **Multi-machine peering** | Static peer list, no discovery | Each node is handed the others' addresses (`node.peers`) and the shared committee (`genesis.toml`) out of band. There is **no peer discovery, no gossip of new validators, and no NAT traversal** — a host behind NAT needs a reachable `listen_addr` (port-forward/public IP). The committee is fixed for the run: **no dynamic membership, no epoch transitions, no stake-weighted leader election** (round-robin only). A misconfigured node fails closed (see below) rather than joining wrongly. |
 | **Client RPC** | Per-connection rate limiting only | Bounds one client; **not Sybil resistance** — many connections get many buckets. Needs stake- or key-weighted admission across connections before public exposure. |
 | **TalonVM** | No state-rollback journal | A trapped transaction's partial writes persist (deterministically on every node). |
 | **Equivocation** | Detected, not slashed | A double-proposing validator is surfaced but not punished. |
@@ -53,7 +54,11 @@ Stated precisely, because "trust-minimized" is easy to claim and hard to earn:
   trusted relayer anywhere in `peregrine-interop`.
 * **Fail-closed everywhere.** A node that cannot verify a proof rejects the
   claim. A build without `--features bls` mints no anchors and therefore
-  accepts nothing. `StrictVerifier` rejects `Proof::Native` outright.
+  accepts nothing. `StrictVerifier` rejects `Proof::Native` outright. A
+  multi-machine node whose identity key is missing, malformed, or **not a member
+  of the shared committee** refuses to start rather than joining under a wrong or
+  borrowed identity; a half-specified peering config (mesh address but no key,
+  key but no peers, …) is rejected before anything binds.
 * **Absence is not zero.** `LoadEthState` traps rather than returning `0` for
   unverified state, and refuses to truncate values wider than 64 bits. The EVM
   contract's `getVerifiedValue` reverts rather than returning zero.

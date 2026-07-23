@@ -240,6 +240,25 @@ struct NodeRunArgs {
     /// Directory holding `validator-{i}.key` for a genesis launch.
     #[arg(long, value_name = "DIR", requires = "genesis")]
     keys_dir: Option<PathBuf>,
+    /// Run as ONE validator identity (0-based index into the genesis validator
+    /// list) — the distributed launch path, where each server is one member of
+    /// the committee. Loads only `validator-{index}.key` and fails closed if it
+    /// does not match genesis. Omit to keep the local all-in-one mode.
+    #[arg(long, value_name = "INDEX", requires = "genesis")]
+    identity: Option<u16>,
+    /// This identity's QUIC mesh listen address, e.g. `0.0.0.0:9001`.
+    #[arg(long, value_name = "ADDR", requires = "identity")]
+    listen: Option<SocketAddr>,
+    /// The OTHER validators' mesh addresses, comma-separated, **in genesis
+    /// index order** (skipping this identity). Order matters — sync is addressed
+    /// by index. e.g. `--peers 1.2.3.4:9001,5.6.7.8:9001`.
+    #[arg(
+        long,
+        value_name = "ADDRS",
+        value_delimiter = ',',
+        requires = "identity"
+    )]
+    peers: Vec<SocketAddr>,
 }
 
 #[derive(Args)]
@@ -476,11 +495,24 @@ async fn run_node(args: NodeRunArgs, cfg: Config) -> Result<()> {
     };
 
     let rpc_addr = args.rpc_addr.unwrap_or(cfg.node.rpc_addr);
-    let (devnet, n_validators) = if let Some(gpath) = &args.genesis {
+
+    // Single-validator (distributed) mode, selected on the command line: run
+    // exactly the identity at `--identity`.
+    if let Some(idx) = args.identity {
+        return run_single_identity(idx, &args, rpc_addr, storage).await;
+    }
+    // The same distributed path, driven entirely by `peregrine.toml`
+    // (`node.identity_key` + `listen_addr` + `peers` + `genesis`). `validate()`
+    // has already checked those four are coherent.
+    if cfg.node.is_multi_machine() {
+        return run_multi_machine(&args, &cfg, rpc_addr, storage).await;
+    }
+    // A genesis may come from the flag or the config; the flag wins.
+    let genesis_path = args.genesis.clone().or_else(|| cfg.node.genesis.clone());
+    let (devnet, n_validators) = if let Some(gpath) = &genesis_path {
         // Launch from a genesis: committee, chain id, faucet, and allocations
         // all come from the file, and each validator loads its own key.
-        let genesis =
-            peregrine_node::genesis::Genesis::load(gpath).context("load genesis")?;
+        let genesis = peregrine_node::genesis::Genesis::load(gpath).context("load genesis")?;
         let keys_dir = args
             .keys_dir
             .clone()
@@ -542,6 +574,216 @@ async fn run_node(args: NodeRunArgs, cfg: Config) -> Result<()> {
             r.id, r.commits, r.pipeline.metrics.committed_records, r.pipeline.metrics.committed_txs
         );
     }
+    Ok(())
+}
+
+/// Run exactly one validator identity, selected on the command line with
+/// `--identity <i>`, `--listen`, and `--peers`.
+async fn run_single_identity(
+    idx: u16,
+    args: &NodeRunArgs,
+    rpc_addr: SocketAddr,
+    storage: Option<PathBuf>,
+) -> Result<()> {
+    use peregrine_node::genesis::Genesis;
+
+    let gpath = args
+        .genesis
+        .as_ref()
+        .expect("clap: --identity requires --genesis");
+    let genesis = Genesis::load(gpath).context("load genesis")?;
+    let n = genesis.validators.len();
+    if (idx as usize) >= n {
+        anyhow::bail!(
+            "identity {idx} has no matching validator: genesis lists {n} (valid indices 0..{})",
+            n - 1
+        );
+    }
+    let keys_dir = args
+        .keys_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--keys-dir is required with --identity"))?;
+    let keypair = load_secret_key(&keys_dir.join(format!("validator-{idx}.key")))
+        .with_context(|| format!("load key for identity {idx}"))?;
+    let listen = args
+        .listen
+        .ok_or_else(|| anyhow::anyhow!("--listen is required with --identity"))?;
+
+    launch_single_validator(
+        &genesis,
+        keypair,
+        idx,
+        listen,
+        &args.peers,
+        rpc_addr,
+        storage,
+    )
+    .await
+}
+
+/// Run exactly one validator identity, driven by `peregrine.toml`'s
+/// `node.identity_key` / `listen_addr` / `peers` / `genesis`.
+///
+/// Unlike the flag path, the committee index isn't given: we derive it by
+/// matching this node's public key against the shared committee, and **fail
+/// closed** if the key isn't a member.
+async fn run_multi_machine(
+    args: &NodeRunArgs,
+    cfg: &Config,
+    rpc_addr: SocketAddr,
+    storage: Option<PathBuf>,
+) -> Result<()> {
+    use peregrine_node::genesis::Genesis;
+
+    // validate() guarantees these are present in multi-machine mode; the flag
+    // still overrides the configured genesis path.
+    let gpath = args
+        .genesis
+        .clone()
+        .or_else(|| cfg.node.genesis.clone())
+        .expect("validate: multi-machine requires node.genesis");
+    let key_path = cfg
+        .node
+        .identity_key
+        .as_ref()
+        .expect("validate: multi-machine requires node.identity_key");
+    let listen = cfg
+        .node
+        .listen_addr
+        .expect("validate: multi-machine requires node.listen_addr");
+
+    let genesis = Genesis::load(&gpath).context("load genesis")?;
+    let keypair = load_secret_key(key_path)
+        .with_context(|| format!("load identity key {}", key_path.display()))?;
+
+    // Which committee member is this key? Fail closed if it is none of them.
+    let committee = genesis.committee()?;
+    let me = keypair.public();
+    let idx = committee_index_of(&committee, me).ok_or_else(|| {
+        anyhow::anyhow!(
+            "identity key {} (public key {}) is not in the committee defined by {} — \
+             fail-closed. Check you distributed the right genesis and key, and that this \
+             node's public key was included in the shared committee.",
+            key_path.display(),
+            hex::encode(me.0),
+            gpath.display(),
+        )
+    })?;
+
+    launch_single_validator(
+        &genesis,
+        keypair,
+        idx,
+        listen,
+        &cfg.node.peers,
+        rpc_addr,
+        storage,
+    )
+    .await
+}
+
+/// The shared body of both distributed launch paths: verify the key against its
+/// committee slot, build the index-ordered mesh address list, start the one
+/// validator, log the committee it joined, and block until Ctrl-C.
+async fn launch_single_validator(
+    genesis: &peregrine_node::genesis::Genesis,
+    keypair: Keypair,
+    idx: u16,
+    listen: SocketAddr,
+    peers: &[SocketAddr],
+    rpc_addr: SocketAddr,
+    storage: Option<PathBuf>,
+) -> Result<()> {
+    use peregrine_core::ValidatorId;
+    use peregrine_node::devnet::{run_single_validator, SingleValidatorOptions};
+
+    let n = genesis.validators.len();
+    if (idx as usize) >= n {
+        anyhow::bail!(
+            "identity {idx} out of range: committee has {n} members (0..{})",
+            n - 1
+        );
+    }
+    let committee = genesis.committee()?;
+    let me = keypair.public();
+    let expected = committee
+        .validator(ValidatorId(idx))
+        .expect("in range")
+        .public_key;
+    if me != expected {
+        anyhow::bail!(
+            "public key mismatch for identity {idx}: the key holds {} but the committee lists {} \
+             (fail-closed — check the key file and the shared genesis)",
+            hex::encode(me.0),
+            hex::encode(expected.0),
+        );
+    }
+    if peers.len() != n - 1 {
+        anyhow::bail!(
+            "expected {} peer addresses (the other validators, in committee-index order, skipping \
+             this one), got {}",
+            n - 1,
+            peers.len()
+        );
+    }
+    // Full index-ordered address list: our listen at `idx`, the peers elsewhere.
+    let mut addrs = Vec::with_capacity(n);
+    let mut it = peers.iter().copied();
+    for j in 0..n {
+        if j == idx as usize {
+            addrs.push(listen);
+        } else {
+            addrs.push(it.next().expect("count checked"));
+        }
+    }
+
+    let chain_id = genesis.chain_id;
+    let network = genesis.network.clone();
+    let v = run_single_validator(SingleValidatorOptions {
+        identity: ValidatorId(idx),
+        keypair,
+        committee: committee.clone(),
+        addrs: addrs.clone(),
+        rpc_addr,
+        max_items_per_vertex: genesis.params.max_items_per_vertex,
+        storage,
+        chain_id,
+        faucet: genesis.faucet_policy()?,
+        allocations: genesis.allocations()?,
+    })
+    .await
+    .context("start validator")?;
+
+    println!("peregrine validator running (multi-machine mode)");
+    println!("  identity   : #{idx} of {n}  ({network})");
+    println!("  public key : {}", hex::encode(me.0));
+    println!("  chain id   : {chain_id}");
+    println!("  listen     : {}  (validator mesh)", v.listen);
+    println!("  rpc        : {}  (clients)", v.rpc_addr);
+    println!("  committee  :");
+    for (j, addr) in addrs.iter().enumerate() {
+        let info = committee
+            .validator(ValidatorId(j as u16))
+            .expect("in range");
+        let marker = if j == idx as usize { "self " } else { "" };
+        println!(
+            "    #{j} stake {:<5} {} @ {addr}  {marker}",
+            info.stake,
+            &hex::encode(info.public_key.0)[..16],
+        );
+    }
+    println!("\nready — press Ctrl-C to stop.");
+
+    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
+    println!("\nshutting down…");
+    let report = v.shutdown().await?;
+    println!(
+        "  {:?}: {} commits, {} records, {} txs",
+        report.id,
+        report.commits,
+        report.pipeline.metrics.committed_records,
+        report.pipeline.metrics.committed_txs
+    );
     Ok(())
 }
 
@@ -678,8 +920,8 @@ fn run_config(cmd: ConfigCmd, cfg: &Config, source: Option<&std::path::Path>) ->
 fn load_secret_key(path: &Path) -> Result<Keypair> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read key file {}", path.display()))?;
-    let bytes = hex::decode(text.trim())
-        .with_context(|| format!("decode key file {}", path.display()))?;
+    let bytes =
+        hex::decode(text.trim()).with_context(|| format!("decode key file {}", path.display()))?;
     let seed: [u8; 32] = bytes
         .as_slice()
         .try_into()
@@ -692,6 +934,25 @@ fn load_validator_keys(dir: &Path, n: usize) -> Result<Vec<Keypair>> {
     (0..n)
         .map(|i| load_secret_key(&dir.join(format!("validator-{i}.key"))))
         .collect()
+}
+
+/// Which committee slot a public key occupies, if any. This is how
+/// multi-machine mode turns "here is my key" into "I am validator #i" without
+/// the operator having to track indices — and how it fails closed when the key
+/// belongs to no committee member.
+fn committee_index_of(
+    committee: &peregrine_core::Committee,
+    key: peregrine_core::PublicKey,
+) -> Option<u16> {
+    use peregrine_core::ValidatorId;
+    (0..committee.size())
+        .find(|&i| {
+            committee
+                .validator(ValidatorId(i as u16))
+                .map(|v| v.public_key)
+                == Some(key)
+        })
+        .map(|i| i as u16)
 }
 
 /// Parse a 64-hex-char public key.
@@ -752,7 +1013,10 @@ fn run_genesis(cmd: GenesisCmd) -> Result<()> {
             let g = Genesis::load(&args.path)?;
             println!("chain id   : {}", g.chain_id);
             println!("network    : {}", g.network);
-            println!("params     : max_items_per_vertex={}", g.params.max_items_per_vertex);
+            println!(
+                "params     : max_items_per_vertex={}",
+                g.params.max_items_per_vertex
+            );
             println!("validators : {}", g.validators.len());
             for (i, v) in g.validators.iter().enumerate() {
                 println!("  [{i}] stake {:<6} {}", v.stake, v.public_key);
@@ -785,7 +1049,10 @@ async fn run_faucet_drip(args: FaucetDripArgs, cfg: Config) -> Result<()> {
         .submit_drip(peregrine_data::faucet::SignedDrip::new(&faucet, drip))
         .await
         .context("submit drip")?;
-    println!("dripped {} grains to {} (queued)", args.amount, args.recipient);
+    println!(
+        "dripped {} grains to {} (queued)",
+        args.amount, args.recipient
+    );
     println!(
         "the on-chain per-recipient limits still apply — confirm with the recipient's balance."
     );
@@ -905,5 +1172,23 @@ mod tests {
         assert_eq!(parse_key("sum").unwrap(), b"sum".to_vec());
         assert_eq!(parse_key("hex:0a0b").unwrap(), vec![0x0a, 0x0b]);
         assert!(parse_key("hex:zz").is_err());
+    }
+
+    /// Multi-machine mode resolves "my key" → "my committee index", and a key
+    /// that isn't a committee member resolves to nothing (→ fail closed).
+    #[test]
+    fn committee_index_matches_the_owning_key_and_rejects_strangers() {
+        use peregrine_core::Keypair;
+        let (genesis, keys, _) =
+            peregrine_node::genesis::Genesis::generate(3, 42, "idx-test", false);
+        let committee = genesis.committee().unwrap();
+
+        // Each generated key maps to its own distinct slot, in order.
+        for (i, kp) in keys.iter().enumerate() {
+            assert_eq!(committee_index_of(&committee, kp.public()), Some(i as u16));
+        }
+        // A key nobody put in the committee has no slot.
+        let stranger = Keypair::from_bytes(&[7u8; 32]);
+        assert_eq!(committee_index_of(&committee, stranger.public()), None);
     }
 }

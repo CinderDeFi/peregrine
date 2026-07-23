@@ -325,9 +325,99 @@ peregrine faucet drip <your-hex-pubkey>                     # get testnet tokens
 parameters, the **faucet** authority + limits, and any initial allocations. The
 faucet's per-request / cooldown / lifetime limits are enforced **on-chain**, so
 no node can hand out more than genesis allows, and only the faucet key can drip.
-Full guide, including multi-host deployment, health checks, and connecting
-wallets: **[docs/TESTNET.md](docs/TESTNET.md)** (`scripts/testnet-local.sh`
-wraps the first two steps).
+
+The command above is the **local all-in-one** mode — the whole committee in one
+process, ideal for a laptop or CI. For a real network, run **one identity per
+server** with `--identity`, `--listen`, and an explicit `--peers` list; each host
+holds only its own validator key and the node **fails closed** if that key
+doesn't match its genesis slot:
+
+```bash
+peregrine node run --genesis genesis.toml --keys-dir keys \
+  --identity 0 --listen 0.0.0.0:9001 --peers 5.6.7.8:9001,9.10.11.12:9001 \
+  --rpc-addr 0.0.0.0:9000 --storage ./data
+```
+
+Full guide — **[Running a distributed testnet](docs/TESTNET.md#running-a-distributed-testnet--one-identity-per-server)**,
+health checks, and connecting wallets: **[docs/TESTNET.md](docs/TESTNET.md)**
+(`scripts/testnet-local.sh` wraps the local steps).
+
+### Multi-machine / multi-node
+
+Two or more machines can form one committee, each running a single validator and
+peering over QUIC. Everything is driven by `peregrine.toml` — no flags to
+remember per host.
+
+**1. Each operator generates a key and shares the _public_ half.**
+
+```bash
+peregrine keygen --out validator.key      # prints the public key; keep validator.key secret (0600)
+```
+
+**2. One operator builds the shared committee** — a `genesis.toml` listing every
+validator's public key + stake, in an agreed order. `peregrine genesis new
+--validators 2 --chain-id 424242` scaffolds one (and writes the keys), or paste
+the collected public keys into the `[[validators]]` list by hand. **Distribute
+the identical `genesis.toml` to every machine.**
+
+**3. Each machine points its config at its own key and the others' addresses.**
+`peers` lists the *other* validators in committee order, skipping itself:
+
+```toml
+# --- machine A (validator #0) : peregrine.toml ---
+[node]
+genesis      = "genesis.toml"
+identity_key = "validator.key"      # A's key — its pubkey is committee slot 0
+listen_addr  = "0.0.0.0:9100"       # what B dials (validator mesh)
+peers        = ["B.example:9100"]   # the other validator(s), committee order
+rpc_addr     = "0.0.0.0:9000"       # clients connect here
+[storage]
+path = "./peregrine-data"
+```
+
+```toml
+# --- machine B (validator #1) : peregrine.toml ---
+[node]
+genesis      = "genesis.toml"
+identity_key = "validator.key"      # B's key — its pubkey is committee slot 1
+listen_addr  = "0.0.0.0:9100"
+peers        = ["A.example:9100"]   # committee order, skipping self
+rpc_addr     = "0.0.0.0:9000"
+[storage]
+path = "./peregrine-data"
+```
+
+Then on each machine just:
+
+```bash
+peregrine node run          # reads ./peregrine.toml; prints its identity + the committee it joined
+```
+
+Each node **derives its own committee index** by matching its key against
+`genesis.toml`, and **fails closed** if the key isn't a committee member, if a
+required field is missing, or if `listen_addr` collides with `rpc_addr`.
+
+**Open ports** (per machine): the **UDP** port in `listen_addr` (here `9100`,
+validator↔validator QUIC) must be reachable by every peer; the `rpc_addr` port
+(`9000`, TCP-like QUIC for clients) only where you want clients/SDKs to reach it.
+No node needs an outbound port opened — QUIC is bidirectional over the one UDP
+socket. There is no peer discovery or NAT traversal: a node behind NAT needs a
+port-forwarded or public `listen_addr`.
+
+**Verify they converged** — write on one machine, read the same value back with
+a proof on the other:
+
+```bash
+# on machine A:
+peregrine submit-tx demo.counter hits 42
+# on machine B (proof verified locally against B's own store root):
+peregrine read demo.counter hits                          # as u64 : 42, proof ✓ verified
+peregrine read demo.counter hits --rpc-addr A.example:9000   # …and A agrees
+```
+
+Identical proven values from independent nodes mean they share one committed
+state. Prefer the CLI-flag form (`--identity/--listen/--peers`, no config file)?
+See **[docs/TESTNET.md](docs/TESTNET.md#running-a-distributed-testnet--one-identity-per-server)**.
 
 ### Watch it live
 
@@ -410,7 +500,7 @@ targets if you prefer.)
 ### Develop
 
 ```bash
-cargo test                                        # 277 tests, all crates
+cargo test                                        # 283 tests, all crates
 cargo test -p peregrine-interop --features bls    # + real BLS / mainnet fixtures
 cd contracts && forge test                        # EVM verifier (48 Foundry tests, incl. real Groth16 e2e)
 cd sdk/js && npm install && npm test              # TypeScript light client + sessions + disclosure/compliance/feeds/agent (82 tests)

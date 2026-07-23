@@ -115,6 +115,61 @@ peregrine node run --genesis genesis.toml --keys-dir testnet-keys \
 The node prints its RPC address and, on shutdown (Ctrl-C), a per-validator commit
 summary. Point the SDK's QUIC client at `--rpc-addr`.
 
+This is the **local all-in-one** mode: `--genesis` without `--identity` runs the
+whole committee in one process (every validator key local). Good for a
+single-host testnet or CI. For a real distributed network, run one identity per
+server:
+
+### Running a distributed testnet — one identity per server
+
+Each physical server runs **one** member of the committee. They share the same
+`genesis.toml`, but every server holds **only its own** validator key and knows
+the mesh addresses of the others.
+
+```bash
+# On server 0 (its key is validator-0.key; peers are validators 1 and 2):
+peregrine node run \
+  --genesis genesis.toml --keys-dir keys \
+  --identity 0 \
+  --listen   0.0.0.0:9001 \
+  --peers    5.6.7.8:9001,9.10.11.12:9001 \
+  --rpc-addr 0.0.0.0:9000 --storage ./data
+
+# On server 1 (identity 1, its peers are validators 0 and 2):
+peregrine node run --genesis genesis.toml --keys-dir keys \
+  --identity 1 --listen 0.0.0.0:9001 --peers 1.2.3.4:9001,9.10.11.12:9001 \
+  --rpc-addr 0.0.0.0:9000 --storage ./data
+
+# …and identity 2, with peers 0 and 2's neighbours, likewise.
+```
+
+Rules that matter:
+
+* **`--identity <i>`** is the 0-based index into `genesis.validators`. The
+  process loads **only** `validator-{i}.key` and **fails closed** if that key
+  doesn't match the genesis public key at index `i`, if `i` is out of range, or
+  if a key is missing — so a server can never join under a borrowed identity.
+* **`--peers`** lists the *other* validators' `--listen` addresses **in
+  genesis-index order, skipping this identity** (identity 0 lists validators 1,
+  2, …; identity 1 lists 0, 2, …). Order matters — ancestor-sync requests are
+  addressed by committee index. Provide exactly `N-1` addresses.
+* **`--listen`** is this node's QUIC mesh address (what its peers dial). It can
+  differ from `--rpc-addr`, the client-facing RPC (bind that `0.0.0.0` to serve
+  publicly, or keep it local and expose only the gateway).
+* **Storage is per-identity:** each node writes its own `validator-{i}.redb`
+  under `--storage`, so nothing is shared. Start order doesn't matter — peers
+  redial with backoff and the mesh heals as each server comes up, which is also
+  what makes restarts non-disruptive.
+
+That's the whole deployment: **one `genesis.toml`, three key files, three start
+commands.** No peer-discovery protocol — the peer list is explicit, which is the
+honest choice for a coordinated testnet.
+
+> The dev transport still uses self-signed TLS with verification skipped; every
+> vertex is independently signature-checked by consensus, so an unauthenticated
+> link can waste bandwidth but cannot forge blocks. Binding validator identity
+> into the certificate is a production follow-up.
+
 ### A public HTTP RPC (for browsers, wallets, the explorer)
 
 Browsers can't speak the node's QUIC RPC directly, so front it with the gateway:

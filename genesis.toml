@@ -1,0 +1,24 @@
+chain_id = 1
+network = "peregrine-testnet"
+allocations = []
+
+[params]
+max_items_per_vertex = 512
+
+[[validators]]
+public_key = "edbd66ba5846154a83742b3b5d3622059842a96341c0db6450c90dc6ebaf4ce1"
+stake = 100
+
+[[validators]]
+public_key = "fdda223cabae605c367d6ced5dce7110b1f835a540897e082b7b335611618da1"
+stake = 100
+
+[[validators]]
+public_key = "baa36c3c3a3be5584cae4e8e3309a89ad2e142ab17aa09dfb1566d723cd907fd"
+stake = 100
+
+[faucet]
+authority = "4c79d54e2b94c1429df6fba5a5e633d8bef9c7f99d84c76923d32552721b9af6"
+per_request = 1000
+cooldown_rounds = 100
+lifetime_cap = 10000

@@ -53,7 +53,7 @@ A working end-to-end system, demonstrable in ten seconds on a laptop:
 | Execution | Metered stack VM — dual meter for compute **and** data bytes |
 | Interop | Ethereum headers + MPT proofs verified in SP1; BLS beacon anchoring; reciprocal Solidity client |
 | Clients | Rust SDK, TypeScript light client, EVM verifier contract |
-| Tests | 277 Rust · 48 Solidity · 82 TypeScript |
+| Tests | 283 Rust · 48 Solidity · 82 TypeScript |
 
 ```bash
 peregrine demo     # streams, VM, light client, and interop — end to end

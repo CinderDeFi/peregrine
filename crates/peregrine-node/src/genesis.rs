@@ -311,7 +311,7 @@ mod tests {
         g.chain_id = 0;
         assert!(g.validate().is_err());
 
-        let (mut g, ..) = Genesis::generate(1.max(2), 1, "t", false);
+        let (mut g, ..) = Genesis::generate(2, 1, "t", false);
         g.validators.truncate(1);
         assert!(g.validate().is_err(), "one validator is refused");
 

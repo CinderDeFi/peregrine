@@ -1,0 +1,6 @@
+[node]
+genesis = "genesis.toml"
+identity_key = "keys/validator-1.key"
+listen_addr = "127.0.0.1:9101"
+peers = ["127.0.0.1:9100"]
+rpc_addr = "127.0.0.1:9001"

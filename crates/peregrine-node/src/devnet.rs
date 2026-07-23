@@ -17,13 +17,14 @@
 
 use crate::payload::WirePayload;
 use crate::pipeline::ExecutionPipeline;
-use crate::quic::{quic_cluster, QuicCluster};
+use crate::quic::{quic_cluster, rebind_node, QuicCluster, QuicNode};
 use crate::rpc::{self, RpcServer};
 use crate::store::Store;
 use crate::tiles::TilePool;
 use crate::validator::{run_validator, NodeReport, Query, ValidatorConfig};
-use anyhow::Context;
-use peregrine_core::{Committee, Keypair, ValidatorId, ValidatorInfo};
+use anyhow::{bail, Context};
+use peregrine_core::{Committee, Keypair, PublicKey, ValidatorId, ValidatorInfo};
+use peregrine_data::faucet::FaucetPolicy;
 use peregrine_data::streams::Publisher;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -257,4 +258,157 @@ impl Devnet {
         reports.sort_by_key(|r| r.id.0);
         Ok(reports)
     }
+}
+
+// ── single-validator (distributed) mode ─────────────────────────────────────
+
+/// How to run **one** validator identity as its own process — the distributed
+/// launch path, where each physical server runs a single member of the
+/// committee and dials the others over real QUIC.
+///
+/// The committee (and thus every validator's public key and stake) comes from
+/// genesis; this process supplies only *its own* secret key and the network
+/// addresses of the set.
+pub struct SingleValidatorOptions {
+    /// This node's index into the genesis validator list.
+    pub identity: ValidatorId,
+    /// This node's secret key. Must match the genesis public key at `identity`.
+    pub keypair: Keypair,
+    /// The full committee, from genesis.
+    pub committee: Committee,
+    /// Every validator's mesh address, **in committee-index order** — this
+    /// node's own listen address at position `identity`, the peers elsewhere.
+    /// Order matters: sync requests are addressed by index.
+    pub addrs: Vec<SocketAddr>,
+    /// Where the client RPC listens.
+    pub rpc_addr: SocketAddr,
+    pub max_items_per_vertex: usize,
+    /// Directory for this identity's redb file (`validator-{i}.redb`). `None` =
+    /// in-memory.
+    pub storage: Option<PathBuf>,
+    /// Genesis-derived state, applied identically on every validator.
+    pub chain_id: u64,
+    pub faucet: Option<FaucetPolicy>,
+    pub allocations: Vec<(PublicKey, u64)>,
+}
+
+/// A single running validator identity: its RPC endpoint, consensus task, and
+/// QUIC transport. Drop it (or [`shutdown`](Self::shutdown)) to take the node
+/// off the network.
+pub struct Validator {
+    /// Address the SDK connects to.
+    pub rpc_addr: SocketAddr,
+    pub id: ValidatorId,
+    /// This node's mesh listen address.
+    pub listen: SocketAddr,
+    shutdown_tx: watch::Sender<bool>,
+    handle: JoinHandle<NodeReport>,
+    _rpc: RpcServer,
+    _node: QuicNode,
+}
+
+impl Validator {
+    /// Stop this validator and return its final report.
+    pub async fn shutdown(self) -> anyhow::Result<NodeReport> {
+        let _ = self.shutdown_tx.send(true);
+        Ok(self.handle.await?)
+    }
+}
+
+/// Run a single validator identity over real QUIC against an explicit peer set.
+///
+/// **Fails closed** if the identity is out of range, the address list does not
+/// cover the committee, or the loaded key does not match the genesis public key
+/// for this identity — so a misconfigured server never joins under a borrowed
+/// identity.
+///
+/// It deliberately pre-registers **no** streams: unlike the in-process devnet
+/// (where every validator shares one generated demo-publisher key), separate
+/// processes have no shared key to register, and registering different keys per
+/// node would diverge their state. Streams/feeds are registered through
+/// committed payloads (`RegisterFeed`), which every validator applies identically.
+pub async fn run_single_validator(opts: SingleValidatorOptions) -> anyhow::Result<Validator> {
+    let n = opts.committee.size();
+    let i = opts.identity.0 as usize;
+    if i >= n {
+        bail!("identity {i} is out of range: genesis lists {n} validators (valid indices 0..{})", n - 1);
+    }
+    if opts.addrs.len() != n {
+        bail!(
+            "expected {n} validator addresses (one per committee member), got {}",
+            opts.addrs.len()
+        );
+    }
+    // Fail-closed identity check: the loaded key must be exactly this index's
+    // committee key, so a server cannot start under an identity it lacks the key for.
+    let expected = opts
+        .committee
+        .validator(opts.identity)
+        .expect("in range")
+        .public_key;
+    if opts.keypair.public() != expected {
+        bail!(
+            "public key mismatch for identity {i}: the loaded key does not match the genesis \
+             validator at that index (fail-closed — check --identity and --keys-dir)"
+        );
+    }
+
+    if let Some(dir) = &opts.storage {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create storage dir {}", dir.display()))?;
+    }
+    let listen = opts.addrs[i];
+
+    // Transport: bind our endpoint to `listen` and mesh against the full address
+    // list (our own slot loops back locally; peers dial with retry/backoff, so
+    // start order between servers does not matter — they heal as each comes up).
+    let mut node = rebind_node(opts.identity, listen, opts.addrs.clone())
+        .await
+        .with_context(|| format!("bind QUIC transport on {listen}"))?;
+    let inbox = node.take_inbox();
+    let net = node.broadcaster();
+
+    let mut pipeline = ExecutionPipeline::new().with_tiles(Arc::new(TilePool::sized_for_machine()));
+    pipeline.chain_id = opts.chain_id;
+    pipeline.faucet = opts.faucet;
+    for (account, grains) in &opts.allocations {
+        pipeline.allocate(account, *grains);
+    }
+
+    let store = match &opts.storage {
+        Some(dir) => Some(
+            Store::open(dir.join(format!("validator-{i}.redb")))
+                .with_context(|| format!("open store for identity {i}"))?,
+        ),
+        None => None,
+    };
+
+    let (ingest_tx, ingest_rx) = mpsc::channel::<WirePayload>(65_536);
+    let (query_tx, query_rx) = mpsc::channel::<Query>(1024);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let handle = tokio::spawn(run_validator(ValidatorConfig {
+        id: opts.identity,
+        keypair: opts.keypair,
+        committee: opts.committee,
+        inbox,
+        net,
+        ingest_rx,
+        shutdown: shutdown_rx,
+        pipeline,
+        max_items_per_vertex: opts.max_items_per_vertex,
+        store,
+        query_rx: Some(query_rx),
+    }));
+
+    let rpc = rpc::serve(opts.rpc_addr, ingest_tx, query_tx)?;
+    Ok(Validator {
+        rpc_addr: rpc.addr,
+        id: opts.identity,
+        listen,
+        shutdown_tx,
+        handle,
+        _rpc: rpc,
+        _node: node,
+    })
 }

@@ -40,10 +40,20 @@ pub struct Config {
 }
 
 /// A locally-run validator network and its client-facing endpoint.
+///
+/// Two launch modes share this table:
+///
+/// * **local (default)** — one process runs the whole `validators`-member
+///   committee, meshed in-process. Nothing below `stream` is set.
+/// * **multi-machine** — set [`identity_key`](Self::identity_key),
+///   [`listen_addr`](Self::listen_addr), [`peers`](Self::peers), and
+///   [`genesis`](Self::genesis), and the process runs as the single committee
+///   member its key identifies, peering with the listed addresses over QUIC.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
-    /// Validators in the committee.
+    /// Validators in the committee (local mode only; multi-machine takes the
+    /// committee from `genesis`).
     pub validators: u16,
     /// Address the client RPC listener binds (port 0 = OS-assigned).
     pub rpc_addr: SocketAddr,
@@ -51,6 +61,35 @@ pub struct NodeConfig {
     pub max_items_per_vertex: usize,
     /// Stream pre-registered on every validator at genesis.
     pub stream: String,
+
+    // --- multi-machine mode (all four required together) ---
+    /// Path to this node's ed25519 key (hex seed, as written by
+    /// `peregrine keygen --out`). Setting this switches the process into
+    /// multi-machine mode: it runs as the one committee member whose public key
+    /// this file holds, and **fails closed** if that key is not in the
+    /// committee.
+    pub identity_key: Option<PathBuf>,
+    /// QUIC/UDP address this node binds for the validator mesh — the address the
+    /// other validators dial (e.g. `0.0.0.0:9100`). Required in multi-machine
+    /// mode; distinct from `rpc_addr`, the client endpoint.
+    pub listen_addr: Option<SocketAddr>,
+    /// The other validators' `listen_addr`s, in committee (genesis) index order,
+    /// **skipping this node**. Order matters — ancestor sync is addressed by
+    /// committee index. Required in multi-machine mode.
+    pub peers: Vec<SocketAddr>,
+    /// The shared `genesis.toml` every validator agrees on — the ordered
+    /// validator public keys + stakes, chain id, faucet, and allocations.
+    /// Required in multi-machine mode; also usable in local mode to launch from
+    /// a genesis. `--genesis` on the command line overrides it.
+    pub genesis: Option<PathBuf>,
+}
+
+impl NodeConfig {
+    /// True when any multi-machine field is set — i.e. the operator is asking
+    /// for the distributed launch path rather than the local all-in-one one.
+    pub fn is_multi_machine(&self) -> bool {
+        self.identity_key.is_some() || self.listen_addr.is_some() || !self.peers.is_empty()
+    }
 }
 
 /// Where committed state is persisted.
@@ -98,6 +137,10 @@ impl Default for NodeConfig {
             rpc_addr: "127.0.0.1:9000".parse().expect("valid default addr"),
             max_items_per_vertex: 512,
             stream: peregrine_node::devnet::DEMO_STREAM.to_string(),
+            identity_key: None,
+            listen_addr: None,
+            peers: Vec::new(),
+            genesis: None,
         }
     }
 }
@@ -172,6 +215,57 @@ impl Config {
     /// Reject configurations that cannot work, and warn about ones that will
     /// work but probably aren't what you want.
     pub fn validate(&self) -> Result<()> {
+        // Multi-machine mode is opt-in and all-or-nothing: setting one of its
+        // fields without the others is almost always a half-finished config, so
+        // fail closed with the specific missing piece rather than silently
+        // falling back to a local committee that ignores what was set.
+        if self.node.is_multi_machine() {
+            if self.node.identity_key.is_none() {
+                bail!(
+                    "node.listen_addr / node.peers are set, but node.identity_key is not. \
+                     Multi-machine mode needs this node's key file to know which committee member \
+                     it is. Set node.identity_key = \"path/to/validator.key\" (from `peregrine \
+                     keygen --out`), or remove listen_addr/peers to run the local committee."
+                );
+            }
+            if self.node.listen_addr.is_none() {
+                bail!(
+                    "node.identity_key is set (multi-machine mode) but node.listen_addr is not. \
+                     Set the QUIC/UDP address other validators dial, e.g. \"0.0.0.0:9100\"."
+                );
+            }
+            if self.node.peers.is_empty() {
+                bail!(
+                    "node.identity_key is set (multi-machine mode) but node.peers is empty. \
+                     List the other validators' listen addresses in committee-index order. \
+                     A single-node committee cannot reach quorum and makes no progress."
+                );
+            }
+            if self.node.genesis.is_none() {
+                bail!(
+                    "multi-machine mode needs the shared committee: set node.genesis to the \
+                     genesis.toml every validator agrees on (or pass --genesis)."
+                );
+            }
+            if self.node.listen_addr == self.node.rpc_addr.into() {
+                bail!(
+                    "node.listen_addr and node.rpc_addr are the same address ({}). The mesh \
+                     (validator↔validator) and the RPC (client→node) are different listeners and \
+                     must not share a port.",
+                    self.node.rpc_addr
+                );
+            }
+            // The mesh + genesis define the committee, so `validators` is unused
+            // here; skip the local-committee sizing checks below.
+            if self.node.max_items_per_vertex == 0 {
+                bail!("node.max_items_per_vertex must be at least 1");
+            }
+            if self.logging.level.trim().is_empty() {
+                bail!("logging.level must not be empty (try \"info\")");
+            }
+            return Ok(());
+        }
+
         // A lone validator's own proposal self-delivers instantly, so it
         // re-proposes in a hot loop with no network round-trip to pace it —
         // it burns a core and grows the DAG without bound.
@@ -242,6 +336,27 @@ rpc_addr = "127.0.0.1:9000"
 max_items_per_vertex = 512
 # Stream pre-registered on every validator at genesis.
 stream = "devnet/demo"
+
+# --- Multi-machine mode (one process = one committee member) ---------------
+# Uncomment all four to run this host as a single validator that peers with the
+# others over QUIC. The committee (ordered public keys + stakes) comes from the
+# shared genesis.toml; this host contributes exactly the key below.
+#
+# Bootstrap (do this once, together):
+#   1. Every operator runs `peregrine keygen --out validator.key` and shares
+#      the printed PUBLIC key.
+#   2. One operator writes those public keys (in an agreed order) into a shared
+#      genesis.toml — `peregrine genesis new --validators N ...` scaffolds one,
+#      or edit the [[validators]] list by hand. Distribute that same file to
+#      every host.
+#   3. On each host, point `genesis` at that file, `identity_key` at this host's
+#      own key, and list the OTHER validators' listen addresses in `peers`, in
+#      the same committee order, skipping yourself.
+#
+# genesis      = "genesis.toml"
+# identity_key = "validator.key"
+# listen_addr  = "0.0.0.0:9100"          # what your peers dial (mesh, not RPC)
+# peers        = ["10.0.0.2:9100", "10.0.0.3:9100"]  # others, committee order
 
 [storage]
 # Directory for per-validator redb files. Comment this out to run purely in
@@ -324,6 +439,102 @@ mod tests {
         assert!(
             err.contains("validatorz"),
             "error should name the bad key: {err}"
+        );
+    }
+
+    /// A fully-specified multi-machine config parses and validates.
+    #[test]
+    fn accepts_complete_multi_machine_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [node]
+            genesis      = "genesis.toml"
+            identity_key = "validator.key"
+            listen_addr  = "0.0.0.0:9100"
+            peers        = ["10.0.0.2:9100", "10.0.0.3:9100"]
+            rpc_addr     = "0.0.0.0:9000"
+            "#,
+        )
+        .expect("parses");
+        assert!(cfg.node.is_multi_machine());
+        cfg.validate()
+            .expect("complete multi-machine config is valid");
+    }
+
+    /// Each missing piece of a multi-machine config fails closed, naming it.
+    #[test]
+    fn multi_machine_fails_closed_on_missing_pieces() {
+        let base = r#"
+            [node]
+            genesis      = "genesis.toml"
+            identity_key = "validator.key"
+            listen_addr  = "0.0.0.0:9100"
+            peers        = ["10.0.0.2:9100"]
+        "#;
+        // Sanity: the base is valid.
+        toml::from_str::<Config>(base).unwrap().validate().unwrap();
+
+        // listen_addr/peers without identity_key.
+        let err = toml::from_str::<Config>(
+            "[node]\nlisten_addr = \"0.0.0.0:9100\"\npeers = [\"10.0.0.2:9100\"]\n",
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("identity_key"), "got: {err}");
+
+        // identity_key without listen_addr.
+        let err = toml::from_str::<Config>(
+            "[node]\ngenesis = \"g.toml\"\nidentity_key = \"v.key\"\npeers = [\"10.0.0.2:9100\"]\n",
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("listen_addr"), "got: {err}");
+
+        // identity_key without peers.
+        let err = toml::from_str::<Config>(
+            "[node]\ngenesis = \"g.toml\"\nidentity_key = \"v.key\"\nlisten_addr = \"0.0.0.0:9100\"\n",
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("peers"), "got: {err}");
+
+        // identity_key without genesis (no shared committee).
+        let err = toml::from_str::<Config>(
+            "[node]\nidentity_key = \"v.key\"\nlisten_addr = \"0.0.0.0:9100\"\npeers = [\"10.0.0.2:9100\"]\n",
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("genesis"), "got: {err}");
+    }
+
+    /// The mesh and the RPC must not share a port.
+    #[test]
+    fn multi_machine_rejects_listen_equal_rpc() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [node]
+            genesis      = "g.toml"
+            identity_key = "v.key"
+            listen_addr  = "0.0.0.0:9100"
+            rpc_addr     = "0.0.0.0:9100"
+            peers        = ["10.0.0.2:9100"]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("same address") || err.contains("share a port"),
+            "got: {err}"
         );
     }
 

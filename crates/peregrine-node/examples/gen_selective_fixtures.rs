@@ -92,7 +92,7 @@ fn disclosure_fixture() -> Value {
         "reveals": reveals,
         // Plaintext of every field, so the test can assert the hidden ones never
         // appear in the disclosure.
-        "allFields": fields.iter().map(|f| hex::encode(f)).collect::<Vec<_>>(),
+        "allFields": fields.iter().map(hex::encode).collect::<Vec<_>>(),
         "hiddenIndices": [0u32, 2],
     })
 }

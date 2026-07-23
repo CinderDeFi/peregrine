@@ -83,7 +83,7 @@ committed fixture is ever absent, so it can never be mistaken for a pass.
 
 | Suite | Result |
 | --- | --- |
-| Rust workspace | 277 passing |
+| Rust workspace | 283 passing |
 | Solidity (Foundry, incl. fuzzing + real-proof e2e) | 48 passing |
 | TypeScript verifier | 82 passing |
 
