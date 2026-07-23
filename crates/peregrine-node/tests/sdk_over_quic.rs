@@ -168,9 +168,36 @@ async fn a_claim_can_be_submitted_over_rpc_but_still_must_verify() {
         .await
         .expect("claim enters the ingest queue");
 
-    // …and consensus refuses it, because the devnet has no verifier and no
-    // anchors. Nothing lands in sys.eth_state.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // …and now we need a *happens-after* signal that consensus has actually run
+    // commit over the round carrying the claim — otherwise the reject metric is
+    // read before the claim was ever evaluated, which is the race that flaked
+    // this test after the validator-loop timing changed. A fixed sleep only
+    // guesses at that; instead submit a marker tx on the SAME connection right
+    // after the claim. The RPC enqueues each submission before it answers, and
+    // the ingest queue is FIFO, so the marker sits strictly behind the claim;
+    // consensus commits in causal order, so once the marker's result is
+    // committed and provable, the claim (in an earlier-or-equal vertex) has been
+    // committed and evaluated by the commit rule. No verification is weakened:
+    // this only synchronises the assertion with the commit it is asserting about.
+    let marker = TableId::named("sdk.claim_marker");
+    client
+        .submit_tx(vec![
+            Instr::Push(1),
+            Instr::StoreTable {
+                table: marker,
+                key: b"done".to_vec(),
+            },
+            Instr::Halt,
+        ])
+        .await
+        .expect("submit marker tx");
+    assert!(
+        await_read(&client, marker, b"done").await.is_some(),
+        "marker tx must commit — its round carries the claim, so the claim was evaluated"
+    );
+
+    // Consensus refused the claim (no verifier, no anchors): nothing lands in
+    // sys.eth_state. Checked live, and again against the final metrics below.
     let key = peregrine_node::pipeline::eth_state_key(1, &[0xc0; 20], &[0x02; 32]);
     let stored = client
         .prove_read(peregrine_node::pipeline::eth_state_table(), &key)
@@ -181,7 +208,10 @@ async fn a_claim_can_be_submitted_over_rpc_but_still_must_verify() {
     let reports = devnet.shutdown().await.expect("shutdown");
     assert!(
         reports[0].pipeline.metrics.foreign_claims_rejected >= 1,
-        "the claim should have been seen and rejected during commit"
+        "the claim should have been seen and rejected during commit (marker committed, so its \
+         round — carrying the claim — was evaluated; rejected={}, applied={})",
+        reports[0].pipeline.metrics.foreign_claims_rejected,
+        reports[0].pipeline.metrics.foreign_claims_applied,
     );
     assert_eq!(
         reports[0].pipeline.metrics.foreign_claims_applied, 0,
