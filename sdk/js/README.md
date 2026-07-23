@@ -56,7 +56,10 @@ Node's QUIC support is still experimental, so **this package does not dial a
 validator directly.** It targets a small JSON gateway in front of a node's RPC
 endpoint, via a swappable `Transport`:
 
-* `HttpTransport` — `POST`s the documented JSON shapes to a gateway URL.
+* `HttpTransport` — `POST`s the documented JSON shapes to a gateway URL. Its
+  default `fetch` is bound to `globalThis` so it works in a browser, where an
+  unbound `Window.fetch` would throw `Illegal invocation`; pass your own
+  already-callable `fetch` as the second argument to override it.
 * your own — implement `Transport` over WebTransport, a WebSocket, or a mock.
 
 **The gateway does not ship in this scaffold yet.** Today the Rust SDK
