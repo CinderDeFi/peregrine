@@ -14,6 +14,97 @@ with.
 
 ---
 
+## Live testnet (running, verified 2026-07-23)
+
+A **single operator** runs a **three-validator** `peregrine-testnet` across three
+hosts, with one HTTP gateway fronting validator 0's RPC. This is a coordinated
+test network, **not a decentralized production chain**. It is **unaudited**, has
+**never been mainnet**, and holds **no real value** — addresses, balances, and
+store roots here are disposable and may be reset. No TPS, audit, or token-economics
+claims apply; there is nothing to buy.
+
+The fuller operator runbook (ports, systemd units, restart procedure, health
+checks, security posture) lives in **[docs/LIVE_TESTNET.md](LIVE_TESTNET.md)**;
+this section is the connection summary.
+
+**Chain**
+
+| Parameter | Value |
+|---|---|
+| network name | `peregrine-testnet` |
+| chain id | `1` |
+| committee | 3 validators, equal stake 100 (quorum is > ⅔ stake, i.e. all three; one down stalls the tip until it returns) |
+| gateway (HTTP/JSON RPC) | `http://37.27.182.133:8081/rpc` |
+| explorer | open the explorer (see [`explorer/README.md`](../explorer/README.md)) with `?gateway=http://37.27.182.133:8081/rpc` |
+| genesis on nodes | `/opt/peregrine/testnet/genesis.toml` |
+| keys on nodes | `/opt/peregrine/testnet/keys/` — `validator-0..2.key`, `faucet.key`, mode `0600` |
+
+**Hosts** — peers are listed in committee-index order, skipping self (see
+[the distributed guidance](#running-a-distributed-testnet--one-identity-per-server)
+below). Storage paths are under `/opt/peregrine/testnet/`.
+
+| Role | Host | `--identity` | `--listen` | `--peers` | `--storage` | node RPC | gateway |
+|---|---|---|---|---|---|---|---|
+| val-1 | `37.27.182.133` | 0 | `0.0.0.0:9001` | `77.42.24.213:9001`, `77.42.22.144:9001` | `…/data-0` | `0.0.0.0:8080` | `0.0.0.0:8081` → node `127.0.0.1:8080` |
+| val-2 | `77.42.24.213` | 1 | `0.0.0.0:9001` | `37.27.182.133:9001`, `77.42.22.144:9001` | `…/data-1` | `0.0.0.0:8080` | — |
+| val-3 | `77.42.22.144` | 2 | `0.0.0.0:9001` | `37.27.182.133:9001`, `77.42.24.213:9001` | `…/data-2` | `0.0.0.0:8080` | — |
+| rpc-1 | `95.216.154.162` | — | — | — | — | — | build / genesis host (optional ops box; not a validator) |
+
+**Faucet** — authority public key from `peregrine genesis show`:
+
+| Field | Value |
+|---|---|
+| authority pubkey | `5cd621cc5b0c710703cf0bf19a5873ce6e53bcff0f61327ee1cb29302b1b50d0` |
+| per request | `1000` grains (largest single drip) |
+| cooldown | `100` rounds between drips, per recipient |
+| lifetime cap | `10000` grains, per recipient |
+| genesis allocations | `0` — every balance comes from the faucet |
+
+### Verified working (2026-07-23)
+
+- All three validators running; tip rounds advancing. Brief `no consensus
+  progress` / `consensus progress resumed` log chatter is observed and recovers
+  on its own — expected when a peer is momentarily busy or a link blips, not a
+  fault.
+- Gateway live at `http://37.27.182.133:8081/rpc`; the explorer queries it via
+  `?gateway=http://37.27.182.133:8081/rpc`.
+- Proven reads verify locally in the client — e.g. `contract.answers` / `meaning`
+  reads back `42` with its proof `✓`.
+- Faucet drip works end to end (below).
+
+The gateway is **HTTP/JSON in front of the QUIC RPC** — read-only and
+CORS-permissive, a **dev posture** suitable for a testnet, not a hardened public
+endpoint. Wallets, the explorer, and SDK readers use the gateway URL and never
+touch the node RPC or the faucet key.
+
+### Faucet drip + read (operator, on a validator host)
+
+Run these on a node host, addressing the local node RPC at `127.0.0.1:8080`. The
+drip is signed by the faucet key and **takes no `--genesis` flag**; the recipient
+public key is the positional argument:
+
+```bash
+# Drip 1000 grains to a recipient (recipient 64-hex pubkey is positional):
+peregrine faucet drip \
+  --rpc-addr 127.0.0.1:8080 \
+  --faucet-key /opt/peregrine/testnet/keys/faucet.key \
+  <RECIPIENT_64_HEX>
+
+# Read the recipient's balance back. `read` takes table then key positionally;
+# the pubkey key is hex, so prefix it with `hex:`.
+peregrine read \
+  --rpc-addr 127.0.0.1:8080 \
+  sys.balances hex:<RECIPIENT_64_HEX>
+```
+
+Confirmed example: recipient
+`b19c978f325f96d786ce0e5edfa0c206674213cbd1c433f456ba11fe5274a4f2` received
+`1000` grains, proof `✓`. The on-chain per-recipient cooldown and lifetime cap
+still apply, so confirm issuance by **reading the balance** rather than trusting
+the drip's "queued" acknowledgement.
+
+---
+
 ## Quick start (one host)
 
 ```bash

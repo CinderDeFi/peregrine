@@ -342,6 +342,10 @@ Full guide — **[Running a distributed testnet](docs/TESTNET.md#running-a-distr
 health checks, and connecting wallets: **[docs/TESTNET.md](docs/TESTNET.md)**
 (`scripts/testnet-local.sh` wraps the local steps).
 
+A live, unaudited 3-validator `peregrine-testnet` (chain id 1) is running — see
+**[docs/TESTNET.md § Live testnet](docs/TESTNET.md#live-testnet-running-verified-2026-07-23)**
+for the gateway URL and connection details.
+
 ### Multi-machine / multi-node
 
 Two or more machines can form one committee, each running a single validator and
