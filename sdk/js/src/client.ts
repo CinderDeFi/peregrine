@@ -69,7 +69,18 @@ export class HttpTransport implements Transport {
   readonly #url: string;
   readonly #fetch: typeof fetch;
 
-  constructor(url: string, fetchImpl: typeof fetch = globalThis.fetch) {
+  // The default MUST stay bound to `globalThis`. In a browser, `fetch` is a
+  // method of `Window`; stored as a bare reference and later called as
+  // `this.#fetch(...)`, it loses its `Window` receiver and throws
+  // `TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation`.
+  // Binding at the default fixes every request path (preferred over a `.call`
+  // at each call site). A caller-supplied `fetchImpl` is used as-is — it is the
+  // caller's responsibility to pass something already callable, and re-binding
+  // it here would defeat a deliberately-bound or wrapped implementation.
+  constructor(
+    url: string,
+    fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
+  ) {
     this.#url = url;
     this.#fetch = fetchImpl;
   }

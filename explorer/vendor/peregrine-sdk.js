@@ -621,7 +621,15 @@ var HttpTransport = class {
   // types and cannot emit the assignments a parameter property implies.
   #url;
   #fetch;
-  constructor(url, fetchImpl = globalThis.fetch) {
+  // The default MUST stay bound to `globalThis`. In a browser, `fetch` is a
+  // method of `Window`; stored as a bare reference and later called as
+  // `this.#fetch(...)`, it loses its `Window` receiver and throws
+  // `TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation`.
+  // Binding at the default fixes every request path (preferred over a `.call`
+  // at each call site). A caller-supplied `fetchImpl` is used as-is — it is the
+  // caller's responsibility to pass something already callable, and re-binding
+  // it here would defeat a deliberately-bound or wrapped implementation.
+  constructor(url, fetchImpl = globalThis.fetch.bind(globalThis)) {
     this.#url = url;
     this.#fetch = fetchImpl;
   }
@@ -787,6 +795,59 @@ function gate(policy, subject, read, storeRoot, nowRound) {
     return { ok: false, reason: "proof does not verify against the store root" };
   }
   return requireCompliant(read.value, nowRound, policy.scheme);
+}
+
+// src/feeds.ts
+var FEED_ENC_V1 = 1;
+var FeedKind = { Price: 0, Rwa: 1, Generic: 2 };
+var KIND_NAMES = ["Price", "Rwa", "Generic"];
+function feedKindName(k) {
+  return KIND_NAMES[k] ?? `kind(${k})`;
+}
+var Aggregation = { Single: 0, Median: 1 };
+function feedLatestTable() {
+  return tableId("sys.feed_latest");
+}
+function decodeFeedValue(bytes) {
+  if (bytes.length !== 21 || bytes[0] !== FEED_ENC_V1) return null;
+  if (bytes[1] > 2 || bytes[3] > 1) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    kind: bytes[1],
+    decimals: bytes[2],
+    aggregation: bytes[3],
+    nSources: bytes[4],
+    value: dv.getBigUint64(5, true),
+    updatedRound: dv.getBigUint64(13, true)
+  };
+}
+function readFeedValue(read, storeRoot) {
+  if (!verifyProvenRead(read, storeRoot)) return null;
+  if (read.value === null) return null;
+  return decodeFeedValue(read.value);
+}
+function staleness(fv, now) {
+  const n = BigInt(now);
+  return n > fv.updatedRound ? n - fv.updatedRound : 0n;
+}
+function isFresh(fv, now, maxStaleness) {
+  return staleness(fv, now) <= BigInt(maxStaleness);
+}
+function feedValueAsNumber(fv) {
+  return Number(fv.value) / 10 ** fv.decimals;
+}
+function encodeObservation(o) {
+  const b = new Uint8Array(17);
+  b[0] = FEED_ENC_V1;
+  const dv = new DataView(b.buffer);
+  dv.setBigUint64(1, o.value, true);
+  dv.setBigUint64(9, o.timestampNs, true);
+  return b;
+}
+function decodeObservation(bytes) {
+  if (bytes.length !== 17 || bytes[0] !== FEED_ENC_V1) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return { value: dv.getBigUint64(1, true), timestampNs: dv.getBigUint64(9, true) };
 }
 
 // node_modules/@noble/curves/node_modules/@noble/hashes/utils.js
@@ -1490,7 +1551,7 @@ function sqrt9mod16(P) {
   const c2 = tn(Fp_, c1);
   const c3 = tn(Fp_, Fp_.neg(c1));
   const c4 = (P + _7n) / _16n;
-  return (Fp2, n) => {
+  return ((Fp2, n) => {
     const F = Fp2;
     let tv1 = F.pow(n, c4);
     let tv2 = F.mul(tv1, c1);
@@ -1504,7 +1565,7 @@ function sqrt9mod16(P) {
     const root = F.cmov(tv1, tv2, e3);
     assertIsSquare(F, root, n);
     return root;
-  };
+  });
 }
 function tonelliShanks(P) {
   if (P < _3n)
@@ -2923,6 +2984,65 @@ function encode(write) {
   write(w);
   return w.finish();
 }
+var BincodeReader = class {
+  #view;
+  #bytes;
+  #off = 0;
+  constructor(bytes) {
+    this.#bytes = bytes;
+    this.#view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  }
+  #need(n) {
+    if (this.#off + n > this.#bytes.length) throw new Error("bincode: unexpected end of input");
+  }
+  /** `n` raw bytes (a `[u8; N]` field). */
+  fixedBytes(n) {
+    this.#need(n);
+    const out = this.#bytes.subarray(this.#off, this.#off + n);
+    this.#off += n;
+    return out;
+  }
+  hash32() {
+    return this.fixedBytes(32);
+  }
+  u32() {
+    this.#need(4);
+    const v = this.#view.getUint32(this.#off, true);
+    this.#off += 4;
+    return v;
+  }
+  u64() {
+    this.#need(8);
+    const v = this.#view.getBigUint64(this.#off, true);
+    this.#off += 8;
+    return v;
+  }
+  bool() {
+    this.#need(1);
+    const b = this.#view.getUint8(this.#off);
+    this.#off += 1;
+    return b !== 0;
+  }
+  /** A `Vec<T>`: `u64` length, then each element via `read`. */
+  vec(read) {
+    const n = Number(this.u64());
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = read(this);
+    return out;
+  }
+  /** A `Vec<u8>`. */
+  byteVec() {
+    return this.fixedBytes(Number(this.u64()));
+  }
+  /** An enum variant tag (`u32`). */
+  variant() {
+    return this.u32();
+  }
+  /** Bytes left unread — should be 0 after decoding a whole value. */
+  remaining() {
+    return this.#bytes.length - this.#off;
+  }
+};
 
 // src/sessions.ts
 var enc2 = new TextEncoder();
@@ -3016,6 +3136,11 @@ var SessionBuilder = class {
     this.#scope.streams.push(stream);
     return this;
   }
+  /** Allow several streams at once — e.g. every source of a feed. */
+  allowStreams(streams) {
+    for (const s of streams) this.#scope.streams.push(s);
+    return this;
+  }
   /** Total spend across the session's whole life. */
   budget(grains) {
     this.#budget = BigInt(grains);
@@ -3042,12 +3167,30 @@ var SessionBuilder = class {
       grantNonce: this.#grantNonce
     };
   }
+  /**
+   * Validate the grant. Throws for a funded session that could never spend — a
+   * budget with no per-action cap — mirroring Rust's `SessionGrant::validate`.
+   * A scope-only session with no budget is valid.
+   */
+  validate() {
+    if (this.#budget > 0n && this.#scope.maxSpendPerAction === 0n) {
+      throw new Error(
+        `grant has a ${this.#budget}-grain budget but a per-action cap of 0 \u2014 it could never spend a grain; call maxPerAction()`
+      );
+    }
+  }
   /** Build and sign, deriving the principal's public key from its secret. */
   sign(principalSecret, sessionKey) {
     return signGrant(
       principalSecret,
       this.build(publicKeyOf(principalSecret), sessionKey)
     );
+  }
+  /** {@link validate} then {@link sign} — preferred, so a misconfigured session
+   *  is caught before submission rather than at spend time. */
+  trySign(principalSecret, sessionKey) {
+    this.validate();
+    return this.sign(principalSecret, sessionKey);
   }
 };
 var SessionSigner = class {
@@ -3074,6 +3217,24 @@ var SessionSigner = class {
     this.#next += 1n;
     return signed;
   }
+  // Ergonomic action builders — one call each, so an agent never hand-assembles
+  // an action or forgets a field. All go through `sign`'s nonce discipline.
+  /** Pay `amount` grains to `payee`. */
+  pay(payee, amount) {
+    return this.sign({ kind: "pay", payee, amount: BigInt(amount) });
+  }
+  /** Subscribe to `stream`, paying `pricePerRecord` per committed record. */
+  subscribe(stream, pricePerRecord) {
+    return this.sign({ kind: "subscribe", stream, pricePerRecord: BigInt(pricePerRecord) });
+  }
+  /** Stop paying for `stream`. */
+  unsubscribe(stream) {
+    return this.sign({ kind: "unsubscribe", stream });
+  }
+  /** Write `value` at `key` in `table` (must be in scope). */
+  write(table, key, value) {
+    return this.sign({ kind: "write", table, key, value });
+  }
   /**
    * Rewind after a rejected submission, so the next attempt reuses the nonce
    * the chain is still expecting. Without this, one refused action would
@@ -3088,10 +3249,47 @@ function id32FromHex(hex) {
   if (b.length !== 32) throw new Error(`expected 32 bytes, got ${b.length}`);
   return b;
 }
+function decodeSessionState(bytes) {
+  try {
+    const r = new BincodeReader(bytes);
+    const grant = {
+      principal: r.hash32(),
+      sessionKey: r.hash32(),
+      scope: {
+        tables: r.vec((rr) => rr.hash32()),
+        streams: r.vec((rr) => rr.hash32()),
+        maxSpendPerAction: r.u64()
+      },
+      budgetGrains: r.u64(),
+      expiresAtRound: r.u64(),
+      grantNonce: r.u64()
+    };
+    const spent = r.u64();
+    const nextNonce = r.u64();
+    const revoked = r.bool();
+    const subscriptions = r.vec((rr) => ({ stream: rr.hash32(), pricePerRecord: rr.u64() }));
+    if (r.remaining() !== 0) return null;
+    return { grant, spent, nextNonce, revoked, subscriptions };
+  } catch {
+    return null;
+  }
+}
+function sessionRemaining(st) {
+  return st.grant.budgetGrains > st.spent ? st.grant.budgetGrains - st.spent : 0n;
+}
+function isActive(st, round) {
+  return !st.revoked && BigInt(round) <= st.grant.expiresAtRound;
+}
+function isSubscribed(st, stream) {
+  return st.subscriptions.some((s) => bytesEqual(s.stream, stream));
+}
 export {
   ACTION_DOMAIN,
+  Aggregation,
+  BincodeReader,
   BincodeWriter,
   ComplianceStatus,
+  FeedKind,
   GRANT_DOMAIN,
   HttpTransport,
   PeregrineClient,
@@ -3106,23 +3304,36 @@ export {
   cellKey,
   combine,
   complianceTable,
+  decodeFeedValue,
   decodeFlag,
+  decodeObservation,
+  decodeSessionState,
   digest,
   encodeAction,
   encodeGrant,
+  encodeObservation,
+  feedKindName,
+  feedLatestTable,
+  feedValueAsNumber,
   fieldLeafBytes,
   fromHex,
   gate,
   id32FromHex,
+  isActive,
+  isFresh,
+  isSubscribed,
   provenReadFromJson,
   publicKeyOf,
+  readFeedValue,
   readU64LE,
   requireCompliant,
   selectiveDisclosureFromJson,
   sessionId,
+  sessionRemaining,
   signAction,
   signGrant,
   signRevocation,
+  staleness,
   tableId,
   toHex,
   verifyMerkle,
@@ -3136,17 +3347,9 @@ export {
   (*! noble-hashes - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
 
 @noble/curves/utils.js:
-  (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
-
 @noble/curves/abstract/modular.js:
-  (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
-
 @noble/curves/abstract/curve.js:
-  (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
-
 @noble/curves/abstract/edwards.js:
-  (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
-
 @noble/curves/ed25519.js:
   (*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) *)
 */
