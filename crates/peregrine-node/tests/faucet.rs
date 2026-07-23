@@ -104,26 +104,41 @@ fn a_recipient_is_rate_limited_by_cooldown_then_lifetime() {
 
     // Round 0: first drip clears.
     node.set_round_for_test(0);
-    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(&auth, drip(alice, 1_000, 0)))));
+    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(
+        &auth,
+        drip(alice, 1_000, 0),
+    ))));
     assert_eq!(balance(&node, &alice), 1_000);
 
     // Round 50: still inside the 100-round cooldown → refused.
     node.set_round_for_test(50);
-    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(&auth, drip(alice, 1_000, 1)))));
+    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(
+        &auth,
+        drip(alice, 1_000, 1),
+    ))));
     assert_eq!(balance(&node, &alice), 1_000, "cooldown holds");
 
     // Round 100: cooldown elapsed → clears (total 2000).
     node.set_round_for_test(100);
-    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(&auth, drip(alice, 1_000, 2)))));
+    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(
+        &auth,
+        drip(alice, 1_000, 2),
+    ))));
     assert_eq!(balance(&node, &alice), 2_000);
 
     // Round 300: another 1000 would blow the 2500 lifetime cap → refused.
     node.set_round_for_test(300);
-    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(&auth, drip(alice, 1_000, 3)))));
+    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(
+        &auth,
+        drip(alice, 1_000, 3),
+    ))));
     assert_eq!(balance(&node, &alice), 2_000, "lifetime cap holds");
 
     // But 500 fits exactly.
-    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(&auth, drip(alice, 500, 4)))));
+    node.apply_payload(&WirePayload::FaucetDrip(Box::new(SignedDrip::new(
+        &auth,
+        drip(alice, 500, 4),
+    ))));
     assert_eq!(balance(&node, &alice), 2_500);
 }
 

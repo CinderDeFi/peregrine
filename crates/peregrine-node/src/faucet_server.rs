@@ -125,7 +125,9 @@ async fn drip(
                 let wait = (s.cooldown - prev.elapsed()).as_secs() + 1;
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({ "ok": false, "error": format!("rate limited; retry in {wait}s") })),
+                    Json(
+                        json!({ "ok": false, "error": format!("rate limited; retry in {wait}s") }),
+                    ),
                 );
             }
         }

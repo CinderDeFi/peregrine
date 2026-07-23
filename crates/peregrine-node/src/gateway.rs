@@ -32,8 +32,8 @@ use axum::{
     Json, Router,
 };
 use peregrine_core::Hash;
-use peregrine_sdk::Client;
 use peregrine_data::tables::{ProvenRead, RowProof, TableId};
+use peregrine_sdk::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -128,7 +128,11 @@ async fn dispatch(client: &Client, req: Value) -> Value {
         },
 
         "proveRead" => {
-            let table = match req.get("table").and_then(Value::as_str).and_then(parse_table) {
+            let table = match req
+                .get("table")
+                .and_then(Value::as_str)
+                .and_then(parse_table)
+            {
                 Some(t) => t,
                 None => return err("proveRead: `table` must be 32-byte hex".into()),
             };

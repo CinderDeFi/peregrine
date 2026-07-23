@@ -18,7 +18,7 @@ use crate::tiles::TilePool;
 use peregrine_consensus::{CommitObserver, Dag};
 use peregrine_core::{Hash, Round};
 use peregrine_data::compliance::{
-    cell_key, compliance_table, CompliancePolicy, ComplianceError, SignedAttestation,
+    cell_key, compliance_table, ComplianceError, CompliancePolicy, SignedAttestation,
 };
 use peregrine_data::faucet::{faucet_table, DripRecord, FaucetPolicy, SignedDrip};
 use peregrine_data::feeds::{
@@ -750,7 +750,10 @@ impl ExecutionPipeline {
         // provider order.
         let mut fresh = Vec::with_capacity(spec.providers.len());
         for p in &spec.providers {
-            if let Some(cell) = self.tables.get(&feed_source_table(), &source_key(&feed_id, p)) {
+            if let Some(cell) = self
+                .tables
+                .get(&feed_source_table(), &source_key(&feed_id, p))
+            {
                 if let Some((value, r)) = decode_source(cell) {
                     if round.saturating_sub(r) <= spec.max_staleness_rounds {
                         fresh.push(value);
@@ -924,8 +927,7 @@ impl ExecutionPipeline {
                 // If this stream belongs to a registered feed, materialize the
                 // observation: update the provider's source cell and re-aggregate
                 // the fresh sources into the feed's latest value.
-                if let Some((feed_id, provider)) =
-                    self.feeds.feed_for_stream(&shred.record.stream)
+                if let Some((feed_id, provider)) = self.feeds.feed_for_stream(&shred.record.stream)
                 {
                     self.materialize_feed_observation(feed_id, provider, &shred.record.payload);
                 }

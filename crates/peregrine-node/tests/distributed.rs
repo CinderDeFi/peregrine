@@ -17,7 +17,10 @@ fn free_addrs(n: usize) -> Vec<SocketAddr> {
     let socks: Vec<std::net::UdpSocket> = (0..n)
         .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"))
         .collect();
-    socks.iter().map(|s| s.local_addr().expect("addr")).collect()
+    socks
+        .iter()
+        .map(|s| s.local_addr().expect("addr"))
+        .collect()
 }
 
 /// The `sum 1..=10 = 55` loop, writing the result into `table["sum"]`.
@@ -25,15 +28,24 @@ fn sum_program(table: TableId) -> Vec<Instr> {
     let sum = b"sum".to_vec();
     vec![
         Instr::Push(0),
-        Instr::StoreTable { table, key: sum.clone() },
+        Instr::StoreTable {
+            table,
+            key: sum.clone(),
+        },
         Instr::Push(10),
         Instr::Dup,
         Instr::JumpIf(6),
         Instr::Jump(13),
         Instr::Dup,
-        Instr::LoadTable { table, key: sum.clone() },
+        Instr::LoadTable {
+            table,
+            key: sum.clone(),
+        },
         Instr::Add,
-        Instr::StoreTable { table, key: sum.clone() },
+        Instr::StoreTable {
+            table,
+            key: sum.clone(),
+        },
         Instr::Push(1),
         Instr::Sub,
         Instr::Jump(3),
@@ -74,8 +86,13 @@ async fn three_independent_validators_form_a_committee_and_converge() {
     // Submit a transaction through validator 0's RPC; it must disseminate and
     // commit on all three.
     let table = TableId::named("dist.contract");
-    let client0 = Client::connect(validators[0].rpc_addr).await.expect("connect v0");
-    client0.submit_tx(sum_program(table)).await.expect("submit tx");
+    let client0 = Client::connect(validators[0].rpc_addr)
+        .await
+        .expect("connect v0");
+    client0
+        .submit_tx(sum_program(table))
+        .await
+        .expect("submit tx");
 
     // One client per validator, to read each node's own committed state.
     let mut clients = Vec::new();
@@ -142,23 +159,30 @@ async fn single_validator_fails_closed_on_misconfiguration() {
     let dup = |kp: &Keypair| Keypair::from_bytes(&kp.to_bytes());
 
     // Wrong key for the identity → refused (fail-closed).
-    let e = run_single_validator(opts(ValidatorId(0), Keypair::from_bytes(&[200; 32]), addrs.clone()))
-        .await
-        .err().expect("must fail")
-        .to_string();
+    let e = run_single_validator(opts(
+        ValidatorId(0),
+        Keypair::from_bytes(&[200; 32]),
+        addrs.clone(),
+    ))
+    .await
+    .err()
+    .expect("must fail")
+    .to_string();
     assert!(e.contains("public key mismatch"), "got: {e}");
 
     // Identity index out of range → refused.
     let e = run_single_validator(opts(ValidatorId(5), dup(&keys[0]), addrs.clone()))
         .await
-        .err().expect("must fail")
+        .err()
+        .expect("must fail")
         .to_string();
     assert!(e.contains("out of range"), "got: {e}");
 
     // Address list doesn't cover the committee → refused.
     let e = run_single_validator(opts(ValidatorId(0), dup(&keys[0]), addrs[..2].to_vec()))
         .await
-        .err().expect("must fail")
+        .err()
+        .expect("must fail")
         .to_string();
     assert!(e.contains("validator addresses"), "got: {e}");
 }

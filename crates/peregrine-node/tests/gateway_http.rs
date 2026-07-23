@@ -68,15 +68,24 @@ async fn gateway_serves_verifiable_json() {
     native
         .submit_tx(vec![
             Instr::Push(0),
-            Instr::StoreTable { table: answers, key: sum.clone() },
+            Instr::StoreTable {
+                table: answers,
+                key: sum.clone(),
+            },
             Instr::Push(10),
             Instr::Dup,
             Instr::JumpIf(6),
             Instr::Jump(13),
             Instr::Dup,
-            Instr::LoadTable { table: answers, key: sum.clone() },
+            Instr::LoadTable {
+                table: answers,
+                key: sum.clone(),
+            },
             Instr::Add,
-            Instr::StoreTable { table: answers, key: sum.clone() },
+            Instr::StoreTable {
+                table: answers,
+                key: sum.clone(),
+            },
             Instr::Push(1),
             Instr::Sub,
             Instr::Jump(3),
@@ -87,13 +96,18 @@ async fn gateway_serves_verifiable_json() {
     await_commit(&native, answers, b"sum").await;
 
     // (2) stand up the gateway on an ephemeral port, fronting the devnet.
-    let app = gateway::build_router(devnet.rpc_addr).await.expect("router");
+    let app = gateway::build_router(devnet.rpc_addr)
+        .await
+        .expect("router");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     // (3) ping and storeRoot come back in the TS-SDK response shapes.
-    assert_eq!(post_rpc(addr, json!({ "kind": "ping" })).await["kind"], "pong");
+    assert_eq!(
+        post_rpc(addr, json!({ "kind": "ping" })).await["kind"],
+        "pong"
+    );
 
     let root = post_rpc(addr, json!({ "kind": "storeRoot" })).await;
     assert_eq!(root["kind"], "root");
@@ -104,16 +118,37 @@ async fn gateway_serves_verifiable_json() {
     // (4) proveRead returns a proof in the exact shape verify.ts expects.
     let table_hex = hex::encode(answers.0 .0);
     let key_hex = hex::encode(b"sum");
-    let resp = post_rpc(addr, json!({ "kind": "proveRead", "table": table_hex, "key": key_hex })).await;
+    let resp = post_rpc(
+        addr,
+        json!({ "kind": "proveRead", "table": table_hex, "key": key_hex }),
+    )
+    .await;
     assert_eq!(resp["kind"], "proof");
     let read = &resp["read"];
     assert!(read.is_object(), "present key yields a proof object");
-    for field in ["table", "key", "value", "tableRoot", "treeVersion", "rowProof", "storeProof"] {
+    for field in [
+        "table",
+        "key",
+        "value",
+        "tableRoot",
+        "treeVersion",
+        "rowProof",
+        "storeProof",
+    ] {
         assert!(read.get(field).is_some(), "proof JSON missing `{field}`");
     }
-    assert!(read["rowProof"]["siblings"].is_array(), "rowProof has siblings");
-    assert!(read["storeProof"]["siblings"].is_array(), "storeProof has siblings");
-    assert!(read["storeProof"]["leafIndex"].is_number(), "storeProof has leafIndex");
+    assert!(
+        read["rowProof"]["siblings"].is_array(),
+        "rowProof has siblings"
+    );
+    assert!(
+        read["storeProof"]["siblings"].is_array(),
+        "storeProof has siblings"
+    );
+    assert!(
+        read["storeProof"]["leafIndex"].is_number(),
+        "storeProof has leafIndex"
+    );
 
     // The value decodes to 55 (little-endian u64), and it is the value the
     // native client's own verified read reports — the gateway added nothing.
@@ -122,14 +157,20 @@ async fn gateway_serves_verifiable_json() {
     assert_eq!(u64::from_le_bytes(value[..8].try_into().unwrap()), 55);
 
     // (5) an absent key reads back as `read: null`, not an error or a zero.
-    let absent = post_rpc(addr, json!({
-        "kind": "proveRead",
-        "table": table_hex,
-        "key": hex::encode(b"no-such-key"),
-    }))
+    let absent = post_rpc(
+        addr,
+        json!({
+            "kind": "proveRead",
+            "table": table_hex,
+            "key": hex::encode(b"no-such-key"),
+        }),
+    )
     .await;
     assert_eq!(absent["kind"], "proof");
-    assert!(absent["read"].is_null(), "absent key must be null, never zero");
+    assert!(
+        absent["read"].is_null(),
+        "absent key must be null, never zero"
+    );
 
     // (6) writes are refused: an explorer observes, it does not submit.
     let refused = post_rpc(addr, json!({ "kind": "submitTx", "program": [] })).await;

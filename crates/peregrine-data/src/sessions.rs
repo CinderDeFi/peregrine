@@ -1094,7 +1094,10 @@ mod tests {
         let s = stream();
         assert_eq!(a.subscribe(s, 2).action.nonce, 1);
         assert_eq!(a.unsubscribe(s).action.nonce, 2);
-        assert_eq!(a.write(table(), b"k".to_vec(), b"v".to_vec()).action.nonce, 3);
+        assert_eq!(
+            a.write(table(), b"k".to_vec(), b"v".to_vec()).action.nonce,
+            3
+        );
     }
 
     #[test]

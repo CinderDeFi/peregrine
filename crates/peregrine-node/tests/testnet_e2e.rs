@@ -54,11 +54,18 @@ async fn a_testnet_launches_from_genesis_and_the_faucet_works() {
     let client = Client::connect(devnet.rpc_addr).await.expect("connect");
 
     // (1) the genesis allocation is present and provable from round one.
-    assert_eq!(await_balance(&client, &prefunded.public(), 5_000).await, 5_000);
+    assert_eq!(
+        await_balance(&client, &prefunded.public(), 5_000).await,
+        5_000
+    );
 
     // (2) a signed faucet drip credits its recipient, over the wire.
     let alice = Keypair::from_bytes(&[77; 32]).public();
-    let drip = FaucetDrip { recipient: alice, amount: 1_000, nonce: 0 };
+    let drip = FaucetDrip {
+        recipient: alice,
+        amount: 1_000,
+        nonce: 0,
+    };
     client
         .submit_drip(SignedDrip::new(&faucet_key, drip))
         .await
@@ -69,12 +76,23 @@ async fn a_testnet_launches_from_genesis_and_the_faucet_works() {
     let impostor = Keypair::from_bytes(&[66; 32]);
     let bob = Keypair::from_bytes(&[55; 32]).public();
     client
-        .submit_drip(SignedDrip::new(&impostor, FaucetDrip { recipient: bob, amount: 500, nonce: 0 }))
+        .submit_drip(SignedDrip::new(
+            &impostor,
+            FaucetDrip {
+                recipient: bob,
+                amount: 500,
+                nonce: 0,
+            },
+        ))
         .await
         .expect("queued");
     // Give it time to be committed and refused.
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(client.balance_of(&bob).await.unwrap(), 0, "a forged drip funds nobody");
+    assert_eq!(
+        client.balance_of(&bob).await.unwrap(),
+        0,
+        "a forged drip funds nobody"
+    );
 
     devnet.shutdown().await.expect("shutdown");
 }

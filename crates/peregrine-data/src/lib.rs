@@ -18,9 +18,9 @@
 pub mod compliance;
 pub mod disclosure;
 pub mod faucet;
-pub mod fees;
 #[cfg(feature = "streams")]
 pub mod feeds;
+pub mod fees;
 pub mod merkle;
 #[cfg(feature = "streams")]
 pub mod sessions;
@@ -36,12 +36,12 @@ pub use compliance::{
 };
 pub use disclosure::{FieldRow, SelectiveDisclosure};
 pub use faucet::{faucet_table, FaucetDrip, FaucetPolicy, SignedDrip};
-pub use fees::{DualMeter, FeeQuote, FeeSchedule, FeeSplit};
 #[cfg(feature = "streams")]
 pub use feeds::{
     feed_latest_table, feed_source_table, feeds_table, Aggregation, FeedId, FeedKind,
     FeedObservation, FeedPublisher, FeedRegistry, FeedSpec, FeedValue,
 };
+pub use fees::{DualMeter, FeeQuote, FeeSchedule, FeeSplit};
 pub use merkle::{MerkleProof, MerkleTree};
 pub use smt::{SmtProof, SparseMerkleTree};
 #[cfg(feature = "streams")]

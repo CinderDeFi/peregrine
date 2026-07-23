@@ -26,8 +26,13 @@ fn balance(node: &ExecutionPipeline, who: &peregrine_core::PublicKey) -> u64 {
 /// does), verifying against the store root.
 fn read_session(node: &mut ExecutionPipeline, id: peregrine_core::Hash) -> SessionState {
     let root = node.store_root();
-    let read = node.prove_read(sessions_table(), &id.0).expect("session present");
-    assert!(read.verify(&root), "session state must verify against the store root");
+    let read = node
+        .prove_read(sessions_table(), &id.0)
+        .expect("session present");
+    assert!(
+        read.verify(&root),
+        "session state must verify against the store root"
+    );
     SessionState::from_bytes(&read.value).expect("session decodes")
 }
 
@@ -163,7 +168,10 @@ fn revocation_stops_payment_immediately() {
             .apply_payload(&WirePayload::Shred(w.feed_pub.observe_at(6_000_000, 0)));
     }
     let st = read_session(&mut w.node, w.session_id);
-    assert_eq!(st.spent, spent_before, "a revoked session pays nothing more");
+    assert_eq!(
+        st.spent, spent_before,
+        "a revoked session pays nothing more"
+    );
     assert!(!st.is_active(2));
 }
 

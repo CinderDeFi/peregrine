@@ -273,7 +273,10 @@ mod tests {
         // The disclosure carries no other field's bytes anywhere.
         for f in [&fields[0], &fields[1], &fields[2]] {
             assert!(
-                !bincode::serialize(&disc).unwrap().windows(f.len()).any(|w| w == f.as_slice()),
+                !bincode::serialize(&disc)
+                    .unwrap()
+                    .windows(f.len())
+                    .any(|w| w == f.as_slice()),
                 "hidden field must not appear in the disclosure"
             );
         }
@@ -317,8 +320,7 @@ mod tests {
 
     #[test]
     fn a_disclosure_does_not_verify_against_the_wrong_root() {
-        let (mut store, table, key, row) =
-            committed_row(vec![b"a".to_vec(), b"b".to_vec()]);
+        let (mut store, table, key, row) = committed_row(vec![b"a".to_vec(), b"b".to_vec()]);
         let _ = store.store_root();
         let read = store.prove_read(table, &key).unwrap();
         let disc = row.disclose(read, &[0]).unwrap();
@@ -335,7 +337,10 @@ mod tests {
         store.insert(table, key.clone(), b"not-the-commitment".to_vec());
         let _ = store.store_root();
         let read = store.prove_read(table, &key).unwrap();
-        assert_eq!(row.disclose(read, &[0]).unwrap_err(), DisclosureError::RootMismatch);
+        assert_eq!(
+            row.disclose(read, &[0]).unwrap_err(),
+            DisclosureError::RootMismatch
+        );
     }
 
     #[test]

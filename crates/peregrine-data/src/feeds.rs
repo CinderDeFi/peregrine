@@ -188,7 +188,10 @@ impl FeedSpec {
     /// session to a whole feed with
     /// `SessionBuilder::new(..).allow_streams(spec.provider_streams())`.
     pub fn provider_streams(&self) -> Vec<StreamId> {
-        self.providers.iter().map(|p| self.provider_stream(p)).collect()
+        self.providers
+            .iter()
+            .map(|p| self.provider_stream(p))
+            .collect()
     }
 
     /// Compact on-chain summary written to `sys.feeds[feed_id]`: enough to prove
@@ -517,7 +520,10 @@ mod tests {
         assert_eq!(aggregate(&[10, 30, 20], Aggregation::Median), 20);
         assert_eq!(aggregate(&[10, 20, 30, 40], Aggregation::Median), 25);
         // A single outlier does not move the median much.
-        assert_eq!(aggregate(&[100, 101, 99, 100, 1_000_000], Aggregation::Median), 100);
+        assert_eq!(
+            aggregate(&[100, 101, 99, 100, 1_000_000], Aggregation::Median),
+            100
+        );
         // Single takes the first (the sole source).
         assert_eq!(aggregate(&[7], Aggregation::Single), 7);
     }

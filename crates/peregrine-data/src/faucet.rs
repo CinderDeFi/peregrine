@@ -77,7 +77,13 @@ impl SignedDrip {
 
     /// Check the drip was signed by `authority`.
     pub fn verify(&self, authority: &PublicKey) -> bool {
-        crypto::verify(authority, FAUCET_DOMAIN, &self.drip.signing_bytes(), &self.signature).is_ok()
+        crypto::verify(
+            authority,
+            FAUCET_DOMAIN,
+            &self.drip.signing_bytes(),
+            &self.signature,
+        )
+        .is_ok()
     }
 }
 
@@ -124,8 +130,14 @@ pub enum FaucetError {
     #[error("amount {amount} exceeds the per-request cap {cap}")]
     ExceedsPerRequest { amount: u64, cap: u64 },
     #[error("recipient dripped at round {last}, cooldown is {cooldown} rounds; now {now}")]
-    Cooldown { last: Round, cooldown: Round, now: Round },
-    #[error("drip of {amount} would exceed the {cap}-grain lifetime cap ({total} already received)")]
+    Cooldown {
+        last: Round,
+        cooldown: Round,
+        now: Round,
+    },
+    #[error(
+        "drip of {amount} would exceed the {cap}-grain lifetime cap ({total} already received)"
+    )]
     ExceedsLifetime { amount: u64, total: u64, cap: u64 },
     #[error("amount must be greater than zero")]
     ZeroAmount,
@@ -218,7 +230,10 @@ mod tests {
         let r = Keypair::from_bytes(&[3; 32]).public();
         assert_eq!(
             policy(auth).authorize(&drip(r, 101, 0), None, 5),
-            Err(FaucetError::ExceedsPerRequest { amount: 101, cap: 100 })
+            Err(FaucetError::ExceedsPerRequest {
+                amount: 101,
+                cap: 100
+            })
         );
         assert!(policy(auth).authorize(&drip(r, 100, 0), None, 5).is_ok());
         assert_eq!(
@@ -234,11 +249,22 @@ mod tests {
         let p = policy(auth);
         // First drip at round 5.
         let rec = p.authorize(&drip(r, 50, 0), None, 5).unwrap();
-        assert_eq!(rec, DripRecord { last_round: 5, total: 50, count: 1 });
+        assert_eq!(
+            rec,
+            DripRecord {
+                last_round: 5,
+                total: 50,
+                count: 1
+            }
+        );
         // Too soon (5 + 10 = 15 needed).
         assert_eq!(
             p.authorize(&drip(r, 50, 1), Some(rec), 14),
-            Err(FaucetError::Cooldown { last: 5, cooldown: 10, now: 14 })
+            Err(FaucetError::Cooldown {
+                last: 5,
+                cooldown: 10,
+                now: 14
+            })
         );
         // Exactly the cooldown boundary is allowed.
         assert!(p.authorize(&drip(r, 50, 1), Some(rec), 15).is_ok());
@@ -250,10 +276,18 @@ mod tests {
         let r = Keypair::from_bytes(&[3; 32]).public();
         let p = policy(auth);
         // Already received 220 of a 250 cap.
-        let prior = DripRecord { last_round: 5, total: 220, count: 3 };
+        let prior = DripRecord {
+            last_round: 5,
+            total: 220,
+            count: 3,
+        };
         assert_eq!(
             p.authorize(&drip(r, 50, 4), Some(prior), 100),
-            Err(FaucetError::ExceedsLifetime { amount: 50, total: 220, cap: 250 })
+            Err(FaucetError::ExceedsLifetime {
+                amount: 50,
+                total: 220,
+                cap: 250
+            })
         );
         // 30 fits exactly.
         let rec = p.authorize(&drip(r, 30, 4), Some(prior), 100).unwrap();
@@ -262,7 +296,11 @@ mod tests {
 
     #[test]
     fn drip_record_round_trips() {
-        let rec = DripRecord { last_round: 42, total: 100, count: 3 };
+        let rec = DripRecord {
+            last_round: 42,
+            total: 100,
+            count: 3,
+        };
         assert_eq!(DripRecord::decode(&rec.encode()), Some(rec));
         assert_eq!(DripRecord::decode(&[0u8; 5]), None);
     }

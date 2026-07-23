@@ -433,14 +433,20 @@ mod tests {
         assert_eq!(flag.scheme, 7);
         assert_eq!(flag.expires_round, 4242);
         assert_eq!(decode_flag(&[]), Err(ComplianceError::MalformedFlag));
-        assert_eq!(decode_flag(&[9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(ComplianceError::MalformedFlag));
+        assert_eq!(
+            decode_flag(&[9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(ComplianceError::MalformedFlag)
+        );
     }
 
     #[test]
     fn require_compliant_enforces_status_and_expiry() {
         let policy = CompliancePolicy::new(keys().1.public());
         // Absent → refused, not a silent pass.
-        assert_eq!(policy.require_compliant(None, 1), Err(ComplianceError::NoAttestation));
+        assert_eq!(
+            policy.require_compliant(None, 1),
+            Err(ComplianceError::NoAttestation)
+        );
 
         let verified = ComplianceAttestation {
             subject: keys().0.public(),
@@ -450,10 +456,15 @@ mod tests {
             issued_round: 1,
             expires_round: 100,
         };
-        assert!(policy.require_compliant(Some(&verified.flag_bytes()), 100).is_ok());
+        assert!(policy
+            .require_compliant(Some(&verified.flag_bytes()), 100)
+            .is_ok());
         assert_eq!(
             policy.require_compliant(Some(&verified.flag_bytes()), 101),
-            Err(ComplianceError::Expired { expires: 100, now: 101 })
+            Err(ComplianceError::Expired {
+                expires: 100,
+                now: 101
+            })
         );
 
         let rejected = ComplianceAttestation {
@@ -462,7 +473,9 @@ mod tests {
         };
         assert_eq!(
             policy.require_compliant(Some(&rejected.flag_bytes()), 50),
-            Err(ComplianceError::NotCompliant { status: ComplianceStatus::Rejected })
+            Err(ComplianceError::NotCompliant {
+                status: ComplianceStatus::Rejected
+            })
         );
     }
 
@@ -494,14 +507,19 @@ mod tests {
         );
         assert_eq!(
             check_attestation(&good, 21),
-            Err(ComplianceError::Expired { expires: 20, now: 21 })
+            Err(ComplianceError::Expired {
+                expires: 20,
+                now: 21
+            })
         );
         let pending = AttestationBuilder::verified(1, 100)
             .status(ComplianceStatus::Pending)
             .sign(&attester, &subject.public());
         assert_eq!(
             check_attestation(&pending, 50),
-            Err(ComplianceError::NotCompliant { status: ComplianceStatus::Pending })
+            Err(ComplianceError::NotCompliant {
+                status: ComplianceStatus::Pending
+            })
         );
     }
 
@@ -519,7 +537,10 @@ mod tests {
         );
         let root = store.store_root();
         let read = store
-            .prove_read(compliance_table(), &cell_key(&subject.public(), &attester.public()))
+            .prove_read(
+                compliance_table(),
+                &cell_key(&subject.public(), &attester.public()),
+            )
             .unwrap();
 
         let policy = CompliancePolicy::new(attester.public());

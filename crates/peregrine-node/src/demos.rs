@@ -979,7 +979,9 @@ pub async fn rwa_templates() -> Result<()> {
 pub async fn compliance() -> Result<()> {
     use crate::pipeline::ExecutionPipeline;
     use peregrine_core::Keypair;
-    use peregrine_data::compliance::{cell_key, compliance_table, AttestationBuilder, CompliancePolicy};
+    use peregrine_data::compliance::{
+        cell_key, compliance_table, AttestationBuilder, CompliancePolicy,
+    };
     use peregrine_data::disclosure::FieldRow;
     use peregrine_data::tables::TableId;
 
@@ -1011,7 +1013,11 @@ pub async fn compliance() -> Result<()> {
         println!(
             "    field #{i} = {:?}   {}",
             String::from_utf8_lossy(v),
-            if ok { "✓ verified against the root" } else { "✗" }
+            if ok {
+                "✓ verified against the root"
+            } else {
+                "✗"
+            }
         );
     }
     println!("  name, date of birth and passport number were never sent.\n");
@@ -1030,7 +1036,8 @@ pub async fn compliance() -> Result<()> {
 
     // The bank attests Alice: Verified, valid for 1000 rounds.
     let attestation = AttestationBuilder::verified(0, 1_000).sign(&bank, &alice.public());
-    node.apply_attestation(&attestation).expect("valid attestation");
+    node.apply_attestation(&attestation)
+        .expect("valid attestation");
     println!("  the bank signed a Verified attestation for Alice");
 
     // Now the same transfer clears — checked against committed state.
@@ -1057,7 +1064,9 @@ pub async fn compliance() -> Result<()> {
         "\n  an auditor checks Alice against the store root alone → {}",
         if verified { "compliant ✓" } else { "✗" }
     );
-    println!("  no node trusted, no global KYC authority — only the root and the attester you chose.");
+    println!(
+        "  no node trusted, no global KYC authority — only the root and the attester you chose."
+    );
     Ok(())
 }
 
@@ -1117,7 +1126,11 @@ pub async fn oracle() -> Result<()> {
             fv.as_f64(),
             fv.n_sources,
             fv.updated_round,
-            if ok { "✓ proven against the store root" } else { "✗" }
+            if ok {
+                "✓ proven against the store root"
+            } else {
+                "✗"
+            }
         );
     }
 
@@ -1191,7 +1204,9 @@ pub async fn agent_data() -> Result<()> {
     }
     fn latest(node: &mut ExecutionPipeline, feed: peregrine_data::feeds::FeedId) -> f64 {
         let root = node.store_root();
-        let read = node.prove_read(feed_latest_table(), &feed.0 .0).expect("feed");
+        let read = node
+            .prove_read(feed_latest_table(), &feed.0 .0)
+            .expect("feed");
         assert!(read.verify(&root));
         FeedValue::decode(&read.value).unwrap().as_f64()
     }

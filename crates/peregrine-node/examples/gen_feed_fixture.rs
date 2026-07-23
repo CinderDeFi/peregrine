@@ -98,7 +98,10 @@ fn main() {
         },
     });
     let text = serde_json::to_string_pretty(&out).unwrap() + "\n";
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sdk/js/test/fixtures/feed.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../sdk/js/test/fixtures/feed.json"
+    );
     std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
     std::fs::write(path, &text).unwrap();
     eprintln!("wrote {path} ({} bytes)", text.len());

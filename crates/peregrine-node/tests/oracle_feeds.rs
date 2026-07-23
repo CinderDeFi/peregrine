@@ -19,7 +19,10 @@ fn kp(seed: u8) -> Keypair {
 fn read_feed(node: &mut ExecutionPipeline, feed_id: FeedId) -> Option<FeedValue> {
     let root = node.store_root();
     let read = node.prove_read(feed_latest_table(), &feed_id.0 .0)?;
-    assert!(read.verify(&root), "feed proof must verify against the store root");
+    assert!(
+        read.verify(&root),
+        "feed proof must verify against the store root"
+    );
     assert!(
         !read.verify(&peregrine_core::Hash::ZERO),
         "feed proof must not verify against a wrong root"
@@ -49,8 +52,10 @@ fn a_median_price_feed_aggregates_and_reads_back_with_a_proof() {
     assert!(node.tables.get(&feeds_table(), &feed_id.0 .0).is_some());
 
     // Three providers publish their latest prices (in cents).
-    let mut pubs: Vec<FeedPublisher> =
-        keys.into_iter().map(|k| FeedPublisher::new(&spec, k)).collect();
+    let mut pubs: Vec<FeedPublisher> = keys
+        .into_iter()
+        .map(|k| FeedPublisher::new(&spec, k))
+        .collect();
     node.set_round_for_test(0);
     for (i, price) in [6_150_000u64, 6_151_000, 6_149_000].iter().enumerate() {
         let shred = pubs[i].observe_at(*price, 0);
@@ -73,8 +78,10 @@ fn a_dark_source_is_dropped_from_the_aggregate() {
     let spec = price_feed(keys.iter().map(|k| k.public()).collect());
     let mut node = ExecutionPipeline::new();
     let feed_id = node.register_feed(spec.clone());
-    let mut pubs: Vec<FeedPublisher> =
-        keys.into_iter().map(|k| FeedPublisher::new(&spec, k)).collect();
+    let mut pubs: Vec<FeedPublisher> = keys
+        .into_iter()
+        .map(|k| FeedPublisher::new(&spec, k))
+        .collect();
 
     // Round 0: all three report.
     node.set_round_for_test(0);

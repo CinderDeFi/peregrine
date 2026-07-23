@@ -60,7 +60,11 @@ fn disclosure_fixture() -> Value {
     let key = b"customer-1".to_vec();
 
     let mut store = TableStore::new();
-    store.insert(TableId::named("sys.other"), b"noise".to_vec(), b"x".to_vec());
+    store.insert(
+        TableId::named("sys.other"),
+        b"noise".to_vec(),
+        b"x".to_vec(),
+    );
     store.insert(table, key.clone(), row.commit().0.to_vec());
     let store_root = store.store_root();
     let read = store.prove_read(table, &key).unwrap();
@@ -68,7 +72,10 @@ fn disclosure_fixture() -> Value {
     // Reveal the residency (index 3) and date of birth (index 1); hide name and
     // passport number.
     let disc = row.disclose(read, &[1, 3]).unwrap();
-    assert!(disc.verify(&store_root), "rust must verify its own disclosure");
+    assert!(
+        disc.verify(&store_root),
+        "rust must verify its own disclosure"
+    );
 
     let reveals: Vec<Value> = disc
         .reveals
@@ -110,7 +117,11 @@ fn compliance_fixture() -> Value {
 
     // Materialize the flag exactly as the node's `apply_attestation` would.
     let mut store = TableStore::new();
-    store.insert(TableId::named("sys.other"), b"noise".to_vec(), b"x".to_vec());
+    store.insert(
+        TableId::named("sys.other"),
+        b"noise".to_vec(),
+        b"x".to_vec(),
+    );
     store.insert(
         compliance_table(),
         cell_key(&subject.public(), &attester.public()),
@@ -147,7 +158,10 @@ fn main() {
     });
     let text = serde_json::to_string_pretty(&out).unwrap() + "\n";
 
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sdk/js/test/fixtures/selective.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../sdk/js/test/fixtures/selective.json"
+    );
     std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
     std::fs::write(path, &text).unwrap();
     eprintln!("wrote {path} ({} bytes)", text.len());

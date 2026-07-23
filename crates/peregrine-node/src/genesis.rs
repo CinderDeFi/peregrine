@@ -118,7 +118,9 @@ impl Genesis {
         with_faucet: bool,
     ) -> (Self, Vec<Keypair>, Option<Keypair>) {
         let mut rng = rand::rngs::OsRng;
-        let validators: Vec<Keypair> = (0..n_validators).map(|_| Keypair::generate(&mut rng)).collect();
+        let validators: Vec<Keypair> = (0..n_validators)
+            .map(|_| Keypair::generate(&mut rng))
+            .collect();
         let faucet_kp = with_faucet.then(|| Keypair::generate(&mut rng));
         let genesis = Genesis {
             chain_id,

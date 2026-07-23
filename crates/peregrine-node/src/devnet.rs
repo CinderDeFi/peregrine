@@ -331,7 +331,10 @@ pub async fn run_single_validator(opts: SingleValidatorOptions) -> anyhow::Resul
     let n = opts.committee.size();
     let i = opts.identity.0 as usize;
     if i >= n {
-        bail!("identity {i} is out of range: genesis lists {n} validators (valid indices 0..{})", n - 1);
+        bail!(
+            "identity {i} is out of range: genesis lists {n} validators (valid indices 0..{})",
+            n - 1
+        );
     }
     if opts.addrs.len() != n {
         bail!(

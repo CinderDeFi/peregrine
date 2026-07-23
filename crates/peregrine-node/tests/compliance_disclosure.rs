@@ -66,13 +66,19 @@ fn a_transfer_is_gated_on_committed_compliance() {
     let policy = CompliancePolicy::new(attester.public());
 
     // No attestation on record → refused, and nothing is credited.
-    assert!(node.compliant_credit(&subject.public(), 100, &policy).is_err());
-    assert!(node.compliance_flag(&subject.public(), &attester.public()).is_none());
+    assert!(node
+        .compliant_credit(&subject.public(), 100, &policy)
+        .is_err());
+    assert!(node
+        .compliance_flag(&subject.public(), &attester.public())
+        .is_none());
 
     // Attest, then the same transfer clears.
     let signed = AttestationBuilder::verified(0, 100).sign(&attester, &subject.public());
     node.apply_attestation(&signed).unwrap();
-    assert!(node.compliant_credit(&subject.public(), 100, &policy).is_ok());
+    assert!(node
+        .compliant_credit(&subject.public(), 100, &policy)
+        .is_ok());
 
     // A policy trusting a *different* attester consults a different (empty)
     // cell, so a stranger's attestation cannot satisfy it.
@@ -108,7 +114,8 @@ fn selective_disclosure_verifies_through_committed_state() {
     // Some unrelated state so the store has several tables/rows.
     node.tables
         .insert(TableId::named("sys.other"), b"a".to_vec(), b"b".to_vec());
-    node.tables.insert(table, key.clone(), row.commit().0.to_vec());
+    node.tables
+        .insert(table, key.clone(), row.commit().0.to_vec());
 
     let root = node.store_root();
     let read = node.prove_read(table, &key).expect("row present");
