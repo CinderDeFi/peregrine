@@ -47,6 +47,21 @@
 //! whole send+reply exchange, [`join_report`] bounds shutdown joins, and the
 //! poll deadline is [`CONDITION_TIMEOUT`]. A genuinely stuck system fails with a
 //! diagnostic in seconds, never a 20-minute hang.
+//!
+//! # Why the restarted node gets its own gate
+//!
+//! Bounding the waits stopped the hang but exposed a second, subtler failure on
+//! CI: the *restarted* validator answered `<no answer>` to every query for the
+//! whole convergence window while the other three converged fine. It was not
+//! wedged and not forked — on rejoin it back-fills a signed vertex for every
+//! round it missed, hundreds of sign+commit+broadcast steps in one loop pass,
+//! and the loop only serviced queries at its top. On a loaded 2-core runner that
+//! catch-up pass ran longer than a client's read timeout every time, so a
+//! healthy-but-busy node looked dead. The real fix lives in the validator loop
+//! (it now drains queries *between* those steps); this test additionally gates
+//! on the restarted node answering a query at all ([`REJOIN_TIMEOUT`]) before
+//! requiring convergence, so "wedged rejoin" and "slow to converge" are distinct,
+//! clearly-labelled failures rather than one ambiguous timeout.
 
 use peregrine_core::{Committee, Hash, Keypair, PublicKey, ValidatorId, ValidatorInfo};
 use peregrine_data::streams::Publisher;
@@ -74,13 +89,16 @@ const RESTART: u16 = 2; // validator we kill and bring back
 /// the point: the earlier this fails, the sooner CI reports a diagnostic
 /// instead of burning the runner.
 ///
-/// History: this was 90s, then 180s, chasing a "flake" that looked like slow
-/// convergence but was really unbounded blocking — a wedged validator's query
-/// never returned, so the poll never re-checked its deadline and the job hung
-/// until the runner killed it. With every wait now individually bounded (see
-/// the module docs), the deadline no longer has to absorb that, and 45s is
-/// ample headroom over the observed ~13s while still failing fast.
-const CONDITION_TIMEOUT: Duration = Duration::from_secs(45);
+/// History: 90s, then 180s, chasing a "flake" that was really unbounded blocking
+/// (a wedged query never returned, so the poll never re-checked its deadline and
+/// the job hung until the runner killed it). Every wait is now individually
+/// bounded (see the module docs), so the deadline no longer has to absorb that.
+/// It sat at 45s until GHA showed the *restarted* node needing longer to answer
+/// while it back-fills its catch-up under a loaded 2-core runner — the real fix
+/// for that is servicing queries mid-catch-up (a validator-loop change) plus the
+/// [`REJOIN_TIMEOUT`] gate below; 90s is headroom over the observed local ~24s,
+/// not a mask, since a genuinely wedged rejoin now fails fast at that gate.
+const CONDITION_TIMEOUT: Duration = Duration::from_secs(90);
 /// Gap between polls. Long enough not to add meaningful query load to the
 /// (possibly CPU-starved) validators being measured — hammering them every few
 /// ms is itself part of what starved their loops on a shared runner — short
@@ -102,6 +120,14 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// stop only has to flush a final snapshot; overrunning this means the task is
 /// wedged, not slow, and the test says so rather than hanging.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on the restarted node answering its *first* query after rejoin.
+/// This gates convergence: a node that never answers here is a wedged rejoin
+/// (not servicing its query channel), which is a different, faster failure than
+/// "rejoined but roots haven't converged". Generous, because a restart on a
+/// loaded runner means restoring the DAG from disk and back-filling the missed
+/// rounds before the loop settles — but bounded, so a truly dead rejoin fails
+/// here in seconds-to-a-minute rather than looking like a convergence timeout.
+const REJOIN_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// One validator's handles, so a phase can talk to it while it runs.
 struct Node {
@@ -469,6 +495,37 @@ async fn crashed_validator_recovers_from_disk() {
             qrx2,
         )),
     };
+
+    // ── Phase 4.5: confirm the restarted node is *alive on its query channel*
+    //    before asking for full convergence. This splits two failure modes that
+    //    otherwise both surface only as a convergence timeout: a rejoin that
+    //    never services queries (wedged — the GHA symptom) versus one that
+    //    rejoined and is merely still catching up. It also records how long the
+    //    first answer took, so a CI failure shows "slow" vs "dead" directly.
+    {
+        let start = Instant::now();
+        let mut first: Option<(u64, u64)> = None;
+        let deadline = start + REJOIN_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Some(progress) = committed_progress(&nodes[RESTART as usize].query).await {
+                first = Some(progress);
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        match first {
+            Some((rounds, records)) => eprintln!(
+                "restart_recovery: v{RESTART} answered its first query {:?} after restart \
+                 (commit_rounds={rounds}, records={records})",
+                start.elapsed()
+            ),
+            None => panic!(
+                "v{RESTART} never answered a query within {REJOIN_TIMEOUT:?} of restart — the \
+                 restarted node is not servicing its query channel (wedged rejoin), not merely \
+                 slow to converge. Look at the validator loop's query drain, not the test timeout."
+            ),
+        }
+    }
 
     // ── Phase 5: more input, then wait for genuine convergence ──────────────
     for _ in 0..150 {

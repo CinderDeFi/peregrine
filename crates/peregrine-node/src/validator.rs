@@ -51,6 +51,14 @@ use tokio::time::Instant;
 /// Max vertices returned in a single sync response (bounds fan-in).
 const MAX_SYNC_BATCH: usize = 1024;
 
+/// While applying a large inbound batch, answer pending client queries every
+/// this many vertices. Small enough that read latency stays a fraction of a
+/// second even on a slow core (a few hundred signature checks), large enough
+/// that the interleave is negligible in steady state. This is what keeps a
+/// rejoining node — flooded with catch-up vertices by peers racing ahead —
+/// observably responsive instead of appearing wedged to a client poller.
+const QUERY_DRAIN_EVERY: usize = 256;
+
 /// Bounded leader-wait: before advancing a round, wait at most this long for
 /// the round's designated anchor to arrive. Short enough to be invisible on
 /// a healthy network, long enough to absorb ordinary delivery jitter — so
@@ -162,6 +170,27 @@ async fn recv_query(rx: &mut Option<mpsc::Receiver<Query>>) -> Option<Query> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Answer every query currently queued, non-blocking. Called not only once per
+/// wake but *between* units of heavy work (applying a synced batch, back-filling
+/// proposals during catch-up) so a long synchronous stretch never leaves a
+/// client read unanswered for seconds.
+///
+/// This is load-bearing for a **restarting** node. On rejoin it back-fills its
+/// own vertex for every round it missed — potentially hundreds of
+/// sign+commit+broadcast steps in a single loop iteration. Draining queries only
+/// at the top of the loop meant that whole storm ran with the query channel
+/// unserviced; on a slow/loaded host it exceeded a client's read timeout every
+/// iteration, so a healthy-but-catching-up node looked wedged (`<no answer>`).
+/// A `oneshot`-based read against committed state is cheap, so servicing them
+/// mid-catch-up costs almost nothing and keeps the node observably alive.
+fn drain_queries(rx: &mut Option<mpsc::Receiver<Query>>, pipeline: &mut ExecutionPipeline) {
+    if let Some(rx) = rx.as_mut() {
+        while let Ok(q) = rx.try_recv() {
+            handle_query(q, pipeline);
+        }
     }
 }
 
@@ -336,11 +365,7 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
 
         // Drain any other queued queries so a burst of client reads is served
         // in this wake rather than one per loop iteration.
-        if let Some(rx) = cfg.query_rx.as_mut() {
-            while let Ok(q) = rx.try_recv() {
-                handle_query(q, &mut pipeline);
-            }
-        }
+        drain_queries(&mut cfg.query_rx, &mut pipeline);
 
         // Drain everything queued so no message sits unprocessed while we
         // block on the next await. Processing one message per wake starves
@@ -374,8 +399,24 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
         }
 
         // Apply all drained network messages, then commit once.
+        //
+        // This batch can be enormous for a rejoining node: three peers racing
+        // ahead at in-process speed hand it thousands of vertices to validate in
+        // a single pass, and each carries a signature check. Servicing queries
+        // only before or after this loop meant that whole pass — seconds of it on
+        // a loaded core — ran with the query channel unanswered, so a poller saw
+        // the (healthy, catching-up) node as `<no answer>`. Interleave a drain
+        // every `QUERY_DRAIN_EVERY` vertices so read latency is bounded by that
+        // slice of work, not by the entire flood. `pipeline` is untouched inside
+        // this loop (commit happens after), so the drain is free to borrow it.
         let mut got_vertices = false;
+        let mut since_drain = 0usize;
         for m in msg_buf.drain(..) {
+            since_drain += 1;
+            if since_drain >= QUERY_DRAIN_EVERY {
+                since_drain = 0;
+                drain_queries(&mut cfg.query_rx, &mut pipeline);
+            }
             match m {
                 NetMessage::Vertex(v) => {
                     if let Some((author, missing)) = buffer_insert(&mut dag, &mut pending, v) {
@@ -386,12 +427,19 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
                     got_vertices = true;
                 }
                 NetMessage::SyncRequest { from, want } => {
-                    // Answer from our DAG with whatever ancestors we hold.
-                    let vertices: Vec<Vertex> = want
-                        .iter()
-                        .filter_map(|h| dag.get(h).cloned())
-                        .take(MAX_SYNC_BATCH)
-                        .collect();
+                    // Answer with the requested vertices **and their ancestors**,
+                    // breadth-first, up to the batch cap. Returning only the exact
+                    // hashes made a far-behind node walk the gap one round per
+                    // round-trip (it parks a frontier vertex, learns its parents,
+                    // asks for those, repeats) — an O(gap) chase that on a loaded
+                    // host loses the race against peers still proposing, so the
+                    // restored node never assembles a committable chain and commits
+                    // nothing. Bundling ancestors makes catch-up O(gap / batch): a
+                    // single response carries a deep chain, so a node restored far
+                    // behind fills the gap in a handful of round-trips. Safe to
+                    // over-send: the requester validates every vertex on insert and
+                    // ignores ones it already holds.
+                    let vertices = collect_with_ancestors(&dag, &want, MAX_SYNC_BATCH);
                     if !vertices.is_empty() {
                         cfg.net
                             .send_to(from, NetMessage::SyncResponse { vertices })
@@ -399,7 +447,15 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
                     }
                 }
                 NetMessage::SyncResponse { vertices } => {
+                    // A bulk catch-up response can hold up to MAX_SYNC_BATCH
+                    // vertices; interleave the query drain here too so processing
+                    // one big response never starves reads for its full duration.
                     for v in vertices {
+                        since_drain += 1;
+                        if since_drain >= QUERY_DRAIN_EVERY {
+                            since_drain = 0;
+                            drain_queries(&mut cfg.query_rx, &mut pipeline);
+                        }
                         if let Some((author, missing)) = buffer_insert(&mut dag, &mut pending, v) {
                             sync_requests_sent +=
                                 request_missing(&cfg.net, cfg.id, author, missing, &mut requested)
@@ -412,12 +468,22 @@ pub async fn run_validator(mut cfg: ValidatorConfig) -> NodeReport {
         }
         if got_vertices {
             committer.try_commit(&dag, &mut pipeline);
+            // Applying a large synced batch can itself be a long stretch; answer
+            // any reads that arrived during it before the (possibly long) propose
+            // back-fill below.
+            drain_queries(&mut cfg.query_rx, &mut pipeline);
         }
 
         // Propose while the previous round has quorum stake — but prefer to
         // include the previous round's anchor so we don't needlessly skip an
         // honest leader (see LEADER_WAIT).
         loop {
+            // A rejoining node back-fills every missed round here, one signed
+            // vertex per iteration — hundreds of them in a single pass. Service
+            // reads each time round so catch-up never makes the node look wedged
+            // to a poller (the CI-hang symptom). Cheap: a no-op when idle.
+            drain_queries(&mut cfg.query_rx, &mut pipeline);
+
             // Never author a second vertex for a round we already hold one of
             // our own at. After an *ungraceful* stop our resume point can trail
             // vertices we broadcast but had not yet flushed; catch-up sync then
@@ -580,6 +646,33 @@ fn rebuild_dag(committee: Committee, mut vertices: Vec<Vertex>) -> Dag {
         }
     }
     dag
+}
+
+/// Collect the requested vertices plus their ancestors — breadth-first over
+/// parent links — up to `cap`. This is what a `SyncRequest` is answered with, so
+/// a peer that is many rounds behind receives a deep chain per response instead
+/// of one round at a time. Bounded by `cap` so a response never approaches the
+/// frame limit; the requester re-validates and de-duplicates everything, so
+/// returning ancestors it may already hold only wastes a little bandwidth.
+fn collect_with_ancestors(dag: &Dag, want: &[Hash], cap: usize) -> Vec<Vertex> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut queue: VecDeque<Hash> = want.iter().copied().collect();
+    while let Some(h) = queue.pop_front() {
+        if out.len() >= cap {
+            break;
+        }
+        if !seen.insert(h) {
+            continue;
+        }
+        if let Some(v) = dag.get(&h) {
+            out.push(v.clone());
+            for p in &v.header.parents {
+                queue.push_back(*p);
+            }
+        }
+    }
+    out
 }
 
 /// Discards every commit callback. Used only to fast-forward a fresh
