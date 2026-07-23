@@ -8,8 +8,14 @@
  * proof fails the local check — which is the whole point of shipping proofs.
  *
  * Two transports, same `Transport` interface:
- *   • HttpTransport  → a live `peregrine gateway` (pass ?gateway=URL)
+ *   • HttpTransport  → a live `peregrine gateway`
  *   • DemoTransport  → bundled real Rust-generated proofs, for GitHub Pages
+ *
+ * Mode selection (see the config block below):
+ *   • `?gateway=URL` → live, against that gateway;
+ *   • `?demo=1`      → offline demo (explicit — always works with no live node);
+ *   • neither        → live, defaulting to the public testnet gateway.
+ * The default gateway is a public **unaudited** testnet holding no real value.
  */
 import {
   PeregrineClient,
@@ -28,9 +34,17 @@ import { DemoTransport } from "./demo-transport.js";
 
 // ── configuration ────────────────────────────────────────────────────────────
 
+// Public testnet gateway used when no `?gateway=` is given and demo is not
+// requested. It is an unaudited testnet with no real value; it is a public
+// endpoint URL, not a secret. Override with `?gateway=<url>` for your own node.
+const DEFAULT_GATEWAY = "http://37.27.182.133:8081/rpc";
+
 const params = new URLSearchParams(location.search);
-const gatewayUrl = params.get("gateway"); // e.g. http://localhost:8080/rpc
-const mode = gatewayUrl ? "live" : "demo";
+// Precedence: explicit `?demo` wins (offline, always works with no live node);
+// otherwise `?gateway=URL`; otherwise the default public testnet gateway (live).
+const gatewayParam = params.get("gateway"); // e.g. http://localhost:8080/rpc
+const mode = params.has("demo") ? "demo" : "live";
+const gatewayUrl = mode === "live" ? gatewayParam || DEFAULT_GATEWAY : null;
 
 // ── state ────────────────────────────────────────────────────────────────────
 
@@ -66,10 +80,16 @@ async function boot() {
   let transport;
   if (mode === "live") {
     transport = new HttpTransport(gatewayUrl);
+    const isDefault = gatewayUrl === DEFAULT_GATEWAY;
     $("banner").className = "banner live";
     $("banner").innerHTML =
-      `<b>Live.</b> Connected to a gateway at <code>${gatewayUrl}</code>. ` +
-      `Every value below is proven by that node and verified here against the store root.`;
+      `<b>Live.</b> Connected to a gateway at <code>${gatewayUrl}</code>` +
+      (isDefault ? ` — the public <b>peregrine-testnet</b> (chain id 1). ` : `. `) +
+      `Every value below is proven by that node and verified here against the store root. ` +
+      (isDefault
+        ? `This is an <b>unaudited</b> public testnet holding <b>no real value</b>. `
+        : ``) +
+      `<a href="?demo=1">View the offline demo</a> instead.`;
   } else {
     const data = await (await fetch("./demo-data.json")).json();
     transport = new DemoTransport(data);
@@ -77,8 +97,8 @@ async function boot() {
     state.demoData = data;
     $("banner").innerHTML =
       `<b>Offline demo.</b> ${data.note} ` +
-      `To point this at a live node, run <code>peregrine node run</code> then ` +
-      `<code>peregrine gateway</code>, and open <code>?gateway=http://localhost:8080/rpc</code>.`;
+      `<a href="?">Connect to the public testnet</a> (live, unaudited, no real value), ` +
+      `or point this at your own node with <code>?gateway=http://localhost:8080/rpc</code>.`;
   }
   state.client = new PeregrineClient(transport);
 
