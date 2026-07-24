@@ -708,6 +708,11 @@ Measured with `peregrine bench` on a **13th-gen Intel i9-13900HX (24C/32T),
 8-second runs. Reproduce with e.g.
 `peregrine bench --validators 4 --rate 5000 --duration 8`.
 
+These are **loopback** numbers (no WAN round-trip). To measure honest,
+app-observable latency against an already-running committee over real network
+RTT, use `peregrine bench --against <host:port>` (client mode) — see
+[docs/TESTNET.md § Load-testing a running network](docs/TESTNET.md#load-testing-a-running-network-client-mode).
+
 | Offered load | Committed throughput | p50 | p99 | keeps up? |
 | --- | --- | --- | --- | --- |
 | 1,000 rec/s | 800 rec/s | 2.1 ms | 33.6 ms | yes |

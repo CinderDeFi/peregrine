@@ -280,12 +280,20 @@ struct BenchArgs {
     /// Total records/sec across publishers; 0 floods as fast as possible.
     #[arg(long)]
     rate: Option<u64>,
-    /// Transport to drive the mesh over.
+    /// Transport to drive the mesh over (local mode only).
     #[arg(long, value_enum)]
     transport: Option<TransportArg>,
-    /// Payload items batched into each proposal.
+    /// Payload items batched into each proposal (local mode only).
     #[arg(long)]
     items_per_vertex: Option<usize>,
+    /// Client mode: drive load against an ALREADY-RUNNING node's QUIC RPC
+    /// (`host:port`) instead of spinning up a local committee. Repeat to spread
+    /// load across several nodes. When set, no local validators are started.
+    #[arg(long = "against", value_name = "HOST:PORT")]
+    against: Vec<SocketAddr>,
+    /// Client mode: number of concurrent submitter connections (default 8).
+    #[arg(long)]
+    concurrency: Option<usize>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -436,6 +444,19 @@ async fn run_async(cmd: Command, cfg: Config) -> Result<()> {
         }
         Command::Bench(args) => {
             let b = &cfg.bench;
+            // Client mode: `--against` given → drive an already-running committee
+            // over the SDK, never starting local validators. Duration defaults to
+            // a short 10s so a bare command can't accidentally hammer a live node.
+            if !args.against.is_empty() {
+                peregrine_node::bench::run_client(peregrine_node::bench::ClientBenchOptions {
+                    addrs: args.against.clone(),
+                    duration: Duration::from_secs(args.duration.unwrap_or(10)),
+                    rate: args.rate.unwrap_or(0),
+                    concurrency: args.concurrency.unwrap_or(8),
+                })
+                .await?;
+                return Ok(());
+            }
             let transport = match args.transport {
                 Some(TransportArg::Quic) => Transport::Quic,
                 Some(TransportArg::Inproc) => Transport::InProcess,

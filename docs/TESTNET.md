@@ -395,6 +395,69 @@ seconds and alerts if either stops changing.
 
 ---
 
+## Load-testing a running network (client mode)
+
+`peregrine bench` has two modes. By default it spins up its *own* loopback
+committee — useful, but its latency has no WAN round-trip. **Client mode**
+(`--against <host:port>`) instead drives an **already-running** committee over
+the SDK's QUIC RPC, exactly as an app would, so the numbers include real network
+RTT and the node's live load. It never starts a validator.
+
+```bash
+# Local baseline (unchanged): bench spins up its own 4-validator loopback mesh.
+peregrine bench --validators 4 --rate 5000 --duration 8
+
+# Client mode, same host as a node (loopback to the local RPC):
+peregrine bench --against 127.0.0.1:8080 --rate 200 --duration 20 --concurrency 8
+
+# Client mode from ANOTHER host (e.g. the ops box rpc-1 → val-1), real WAN RTT:
+peregrine bench --against 37.27.182.133:8080 --rate 200 --duration 20 --concurrency 8
+
+# Spread load across all three validators:
+peregrine bench --against 37.27.182.133:8080 \
+                --against 77.42.24.213:8080 \
+                --against 77.42.22.144:8080 \
+                --rate 300 --duration 20 --concurrency 12
+```
+
+**What it does.** Each of `--concurrency` connections submits Talon **table
+writes** (`submit_tx`) at the target `--rate` (total writes/s; `0` = as fast as
+each connection's ack round-trip allows). Table writes are the permissionless
+path — `sys.balances` is credit-only, so no balance, fee, or genesis-registered
+key is needed. Every write goes to a unique key and is **confirmed** by polling a
+proven read of that key until it appears.
+
+**Reading the table.**
+
+| Row | Meaning |
+|---|---|
+| offered rate | your `--rate` target (writes/s), or `max` |
+| submitted / achieved | writes the node **accepted** into its queue, and that rate |
+| confirmed / sampled | of the sampled writes, how many became provable (committed) |
+| est. committed rate | achieved submit × confirmed fraction — an **estimate**, not every write is confirmed under a firehose |
+| publish→confirm p50/p99/max | **submit → the client first proves the write committed.** Client-observed, so it includes the confirming read's round-trip — an *upper bound* on in-consensus publish→commit, and the number an app actually feels |
+| errors | `rejected` (node refused, e.g. rate limit), `disconnect` (transport fault), `confirm-timeout` (accepted but never observed within 20 s) |
+
+**Loopback-vs-WAN recipe.** Run the local baseline and client-mode-against-`127.0.0.1:8080`
+on a validator host, then client-mode from a *different* host against the same
+node. The p50/p99 gap between the last two is your real client↔committee RTT;
+the submit-rate gap shows how much the WAN path costs versus loopback. Raise
+`--concurrency` (not just `--rate`) for throughput — each connection's submit is
+ack-synchronous, so aggregate throughput scales with connections.
+
+**Safety.** Duration defaults to a short **10 s** so a bare `--against` command
+cannot accidentally hammer a live node; ask for longer runs explicitly with
+`--duration`. Client mode uses an **ephemeral client** — no validator or faucet
+keys are involved. An unreachable node fails immediately with a clear message
+rather than a run full of disconnect counts.
+
+> This is a **public, unaudited testnet with no real value.** These are
+> engineering measurements — always report the validator count, where the client
+> ran (same host vs external), the transport, and the offered-vs-achieved rate
+> alongside any p50/p99. Never a bare "N TPS" or a superlative.
+
+---
+
 ## Security checklist before going public
 
 - [ ] The **faucet key** lives only where the faucet runs, not on the RPC host.
