@@ -456,6 +456,18 @@ real client↔committee RTT; the accepted-rate gap shows what the WAN path costs
 Raise `--concurrency` (not just `--rate`) for throughput — each connection's
 submit is ack-synchronous, so aggregate throughput scales with connections.
 
+**Cross-host client RPC.** Client mode over the network (`--against <peer>:8080`)
+works: the SDK client binds a routable local socket and disables UDP segmentation
+offload on transmit, so it does not depend on kernel GSO/ECN offload behaving.
+The node RPC must be reachable — bind it with `--rpc-addr 0.0.0.0:8080` and open
+**UDP** 8080 to the client host (RPC is QUIC/UDP; a TCP probe to 8080 proves
+nothing — use `nc -vzu <host> 8080`). If a client still logs `sendmsg` … `Invalid
+argument` / "halting segmentation offload" and then a connect timeout, report:
+the client and node OS/kernel (`uname -a`), the exact `peregrine bench --against`
+command, and whether the validator **mesh** on `:9001` between the same hosts is
+up (it uses the same QUIC stack, so if the mesh works but the client does not,
+that difference is the useful signal).
+
 **Safety.** Duration defaults to a short **10 s** so a bare `--against` command
 cannot accidentally hammer a live node; ask for longer runs explicitly with
 `--duration`. Client mode uses an **ephemeral client** — no validator or faucet

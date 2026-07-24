@@ -12,7 +12,8 @@ use peregrine_data::streams::StreamShred;
 use peregrine_data::tables::{ProvenRead, TableId};
 use peregrine_interop::VerifiedClaim;
 use peregrine_vm::Instr;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 /// Errors surfaced by the SDK. Transport/codec faults are separated from a
 /// node-reported error so callers can distinguish "couldn't reach the node"
@@ -45,12 +46,7 @@ pub struct Client {
 impl Client {
     /// Connect to a node's RPC endpoint.
     pub async fn connect(addr: SocketAddr) -> Result<Self, SdkError> {
-        let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let mut endpoint =
-            quinn::Endpoint::client(bind).map_err(|e| SdkError::Connect(e.to_string()))?;
-        endpoint.set_default_client_config(
-            tls::client_config().map_err(|e| SdkError::Connect(e.to_string()))?,
-        );
+        let endpoint = client_endpoint(addr)?;
         let conn = endpoint
             .connect(addr, "localhost")
             .map_err(|e| SdkError::Connect(e.to_string()))?
@@ -273,5 +269,75 @@ impl Client {
             RpcResponse::Error(e) => Err(SdkError::Node(e)),
             _ => Err(SdkError::Unexpected),
         }
+    }
+}
+
+/// Build (and bind) a QUIC client endpoint able to reach `addr`, with the
+/// offload-safe transport config. Split out from [`Client::connect`] so the
+/// bind-and-config path can be exercised without a live server.
+///
+/// Two things make this work across hosts:
+/// * it binds the **unspecified** address of `addr`'s family (`0.0.0.0:0` /
+///   `[::]:0`), never loopback — a `127.0.0.1`-bound UDP socket cannot route to
+///   a remote host, so every send fails with `sendmsg: EINVAL`, which quinn-udp
+///   surfaces as a segmentation-offload / ECN error before the handshake times
+///   out. That was the cross-host `--against <peer>` failure; loopback masked it
+///   because a loopback socket can reach `127.0.0.1`;
+/// * it disables UDP generic segmentation offload on transmit. Some kernels
+///   (seen on Ubuntu 26.04) reject the batched `sendmsg` with EINVAL ("halting
+///   segmentation offload"); per-packet sends are a touch less efficient but
+///   always work. ECN has no public toggle in Quinn 0.11 and needs none — with
+///   a routable bind it sends fine (the validator mesh proves it on the same
+///   stack). No sysctl required on any host.
+fn client_endpoint(addr: SocketAddr) -> Result<quinn::Endpoint, SdkError> {
+    let bind: SocketAddr = if addr.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let mut endpoint =
+        quinn::Endpoint::client(bind).map_err(|e| SdkError::Connect(e.to_string()))?;
+
+    let mut cfg = tls::client_config().map_err(|e| SdkError::Connect(e.to_string()))?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.enable_segmentation_offload(false);
+    cfg.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(cfg);
+    Ok(endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The client must bind a *routable* (unspecified) local address, not
+    /// loopback — the regression that made cross-host `--against <peer>` fail.
+    /// Uses a documentation/TEST-NET target (RFC 5737), never actually dialed.
+    /// `Endpoint::client` binds a socket and starts a driver, so it needs a
+    /// Tokio runtime — hence `#[tokio::test]`, not a plain `#[test]`.
+    #[tokio::test]
+    async fn client_binds_unspecified_not_loopback() {
+        let v4: SocketAddr = "203.0.113.10:8080".parse().unwrap();
+        let ep = client_endpoint(v4).expect("build v4 client endpoint with safe config");
+        let local = ep.local_addr().expect("bound local addr");
+        assert!(
+            local.ip().is_unspecified(),
+            "client must bind 0.0.0.0, not {} (loopback can't reach a remote host)",
+            local.ip()
+        );
+        assert!(local.ip().is_ipv4(), "v4 target should bind a v4 socket");
+    }
+
+    #[tokio::test]
+    async fn client_binds_unspecified_for_ipv6_target() {
+        let v6: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        // Skip gracefully on hosts without IPv6 (some CI runners): the point is
+        // family-matched *unspecified* binding, which the v4 test already pins.
+        let Ok(ep) = client_endpoint(v6) else {
+            return;
+        };
+        let local = ep.local_addr().expect("bound local addr");
+        assert!(local.ip().is_unspecified(), "v6 client must bind [::]");
+        assert!(local.ip().is_ipv6(), "v6 target should bind a v6 socket");
     }
 }
