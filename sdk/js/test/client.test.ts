@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 
 import { fromHex, readU64LE, toHex } from "../src/hash.ts";
 import {
+  HttpTransport,
   PeregrineClient,
   PeregrineError,
   ProofVerificationError,
@@ -128,5 +129,91 @@ describe("PeregrineClient", () => {
     const req = stub.seen.at(-1)!;
     assert.equal(req.kind, "proveRead");
     assert.equal((req as { table: string }).table, toHex(tableId("contract.answers")));
+  });
+});
+
+/**
+ * Browser regression: the default `fetch` MUST stay bound to `globalThis`.
+ *
+ * In a browser, `fetch` is a method of `Window`. `HttpTransport` stores the
+ * fetch it is given and later calls it as `this.#fetch(url, opts)` — a
+ * method-call whose receiver is the transport instance, not `Window`. A browser
+ * enforces the receiver and throws
+ *   TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation
+ * so a bare `globalThis.fetch` default is broken in exactly the environment the
+ * explorer runs in, while working fine under Node (which does not check).
+ *
+ * This test reproduces the browser's check rather than faking it: it installs a
+ * `globalThis.fetch` that throws unless its receiver is `globalThis`, and drives
+ * a real `HttpTransport` through its DEFAULT constructor. It passes only while
+ * the default is `globalThis.fetch.bind(globalThis)`; revert to the bare
+ * reference and it fails with the same Illegal-invocation error the explorer hit.
+ */
+describe("HttpTransport default fetch binding", () => {
+  /** A `fetch` that mimics the browser: legal only when called on `globalThis`. */
+  function receiverCheckingFetch(this: unknown): Promise<Response> {
+    if (this !== globalThis) {
+      throw new TypeError(
+        "Failed to execute 'fetch' on 'Window': Illegal invocation",
+      );
+    }
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({ kind: "root", root: "00".repeat(32) }) as RpcResponse,
+    } as Response);
+  }
+
+  /** Run `body` with `globalThis.fetch` swapped, always restoring the original. */
+  async function withGlobalFetch(
+    impl: typeof fetch,
+    body: () => Promise<void>,
+  ): Promise<void> {
+    const original = globalThis.fetch;
+    globalThis.fetch = impl;
+    try {
+      await body();
+    } finally {
+      globalThis.fetch = original;
+    }
+  }
+
+  it("uses the default fetch with the Window receiver (no Illegal invocation)", async () => {
+    await withGlobalFetch(receiverCheckingFetch as typeof fetch, async () => {
+      // Default constructor path — this is what `PeregrineClient.http` and the
+      // explorer use. The bind must happen here.
+      const transport = new HttpTransport("https://gateway.example/rpc");
+      const res = await transport.request({ kind: "storeRoot" });
+      assert.deepEqual(res, { kind: "root", root: "00".repeat(32) });
+    });
+  });
+
+  it("honors a caller-supplied fetch as-is (used, not re-bound)", async () => {
+    // A caller may pass a fetch already bound to some other object (a mock, a
+    // proxy, a Node polyfill). We must call it as given, so this custom impl —
+    // which asserts it was NOT re-pointed at globalThis — has to succeed.
+    const calls: Array<{ url: string; self: unknown }> = [];
+    const custom = function (this: unknown, url: string): Promise<Response> {
+      calls.push({ url, self: this });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ kind: "pong" }) as RpcResponse,
+      } as Response);
+    } as unknown as typeof fetch;
+
+    // Install a hostile global fetch so a stray default-bind would be caught.
+    await withGlobalFetch(
+      (() => {
+        throw new Error("default fetch must not be used when a custom one is passed");
+      }) as unknown as typeof fetch,
+      async () => {
+        const transport = new HttpTransport("https://gateway.example/rpc", custom);
+        const res = await transport.request({ kind: "ping" });
+        assert.deepEqual(res, { kind: "pong" });
+      },
+    );
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.url, "https://gateway.example/rpc");
   });
 });
