@@ -18,29 +18,32 @@ async fn client_bench_drives_a_running_devnet_and_confirms_commits() {
     // A real local committee with a client-facing RPC endpoint.
     let devnet = Devnet::start().await.expect("start devnet");
 
-    // Drive it exactly as `peregrine bench --against <rpc> --rate 200 --duration 2`
-    // would: no local validators started here — we connect as an external client.
+    // Drive it as `peregrine bench --against <rpc> --rate 16 --duration 3` would:
+    // no local validators started here — we connect as an external client. The
+    // rate is kept well under the per-connection RPC submit budget (16 tokens per
+    // submit, 128/s refill → ~8 submits/s/connection; 4 connections ⇒ ~32/s), so
+    // a healthy paced run should see essentially no rejects.
     let report = run_client(ClientBenchOptions {
         addrs: vec![devnet.rpc_addr],
-        duration: Duration::from_secs(2),
-        rate: 200,
+        duration: Duration::from_secs(3),
+        rate: 16,
         concurrency: 4,
     })
     .await
     .expect("client bench runs against the devnet");
 
-    // It submitted work…
+    // It submitted work and the node accepted it…
     assert!(
-        report.submitted > 0,
-        "the harness should have submitted writes (got {})",
-        report.submitted
+        report.accepted > 0,
+        "the harness should have accepted writes (attempted {}, accepted {})",
+        report.attempted,
+        report.accepted
     );
     // …and observed commits via proven reads (the confirm path works)…
     assert!(
         report.confirmed > 0,
-        "at least one write must be confirmed committed (submitted {}, tracked {}, confirmed {})",
-        report.submitted,
-        report.tracked,
+        "at least one write must be confirmed committed (accepted {}, confirmed {})",
+        report.accepted,
         report.confirmed
     );
     // …with a real, positive publish→confirm latency recorded.
@@ -48,6 +51,24 @@ async fn client_bench_drives_a_running_devnet_and_confirms_commits() {
         report.p50_ms > 0.0,
         "a positive publish→confirm latency should be measured (p50={} ms)",
         report.p50_ms
+    );
+    // Pacing must honor --rate: no reject storm. Below node capacity, rejects
+    // should be a small fraction of attempts — the old per-worker over-issue put
+    // rejects *above* accepts. Allow generous slack for CI timing.
+    assert!(
+        report.rejected * 4 <= report.attempted.max(1),
+        "rejects should be a small fraction under capacity, not a storm \
+         (attempted {}, accepted {}, rejected {})",
+        report.attempted,
+        report.accepted,
+        report.rejected
+    );
+    // Attempted must track the offered rate, not overshoot ~100×. Offered ≈ 16/s
+    // over 3s ≈ 48; allow a wide band but catch a runaway (which was ~thousands).
+    assert!(
+        report.attempted <= 300,
+        "attempted ({}) should track the ~16 writes/s offered rate, not overshoot",
+        report.attempted
     );
     // The node is up, so nothing should be a hard disconnect.
     assert_eq!(

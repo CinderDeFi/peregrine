@@ -407,43 +407,54 @@ RTT and the node's live load. It never starts a validator.
 # Local baseline (unchanged): bench spins up its own 4-validator loopback mesh.
 peregrine bench --validators 4 --rate 5000 --duration 8
 
-# Client mode, same host as a node (loopback to the local RPC):
-peregrine bench --against 127.0.0.1:8080 --rate 200 --duration 20 --concurrency 8
+# Client mode, same host as a node (loopback). Rate under the per-connection
+# budget (~8 submits/s × 8 connections ≈ 64/s) so rejects stay ~0:
+peregrine bench --against 127.0.0.1:8080 --rate 40 --duration 20 --concurrency 8
 
 # Client mode from ANOTHER host (e.g. the ops box rpc-1 → val-1), real WAN RTT:
-peregrine bench --against 37.27.182.133:8080 --rate 200 --duration 20 --concurrency 8
+peregrine bench --against 37.27.182.133:8080 --rate 40 --duration 20 --concurrency 8
 
-# Spread load across all three validators:
+# Spread load across all three validators (more connections → more headroom):
 peregrine bench --against 37.27.182.133:8080 \
                 --against 77.42.24.213:8080 \
                 --against 77.42.22.144:8080 \
-                --rate 300 --duration 20 --concurrency 12
+                --rate 80 --duration 20 --concurrency 12
 ```
 
-**What it does.** Each of `--concurrency` connections submits Talon **table
-writes** (`submit_tx`) at the target `--rate` (total writes/s; `0` = as fast as
-each connection's ack round-trip allows). Table writes are the permissionless
-path — `sys.balances` is credit-only, so no balance, fee, or genesis-registered
-key is needed. Every write goes to a unique key and is **confirmed** by polling a
-proven read of that key until it appears.
+**What it does.** A **global rate pacer** hands submit permits out at `--rate`
+across all `--concurrency` connections, so *attempted* submits track the offered
+rate (a small burst, never a 100× overshoot); `--rate 0` means unpaced/ack-bound.
+Each connection submits Talon **table writes** (`submit_tx`) — the permissionless
+path (`sys.balances` is credit-only, so no balance, fee, or genesis-registered
+key is needed). Every write goes to a unique key and is **confirmed** on a
+**separate read connection** (so confirming reads never spend the submit
+connection's rate budget) by proving that key, with a 1 ms→20 ms adaptive
+backoff. A rejected submit is counted and **not** retried.
 
 **Reading the table.**
 
 | Row | Meaning |
 |---|---|
 | offered rate | your `--rate` target (writes/s), or `max` |
-| submitted / achieved | writes the node **accepted** into its queue, and that rate |
-| confirmed / sampled | of the sampled writes, how many became provable (committed) |
-| est. committed rate | achieved submit × confirmed fraction — an **estimate**, not every write is confirmed under a firehose |
-| publish→confirm p50/p99/max | **submit → the client first proves the write committed.** Client-observed, so it includes the confirming read's round-trip — an *upper bound* on in-consensus publish→commit, and the number an app actually feels |
-| errors | `rejected` (node refused, e.g. rate limit), `disconnect` (transport fault), `confirm-timeout` (accepted but never observed within 20 s) |
+| attempted | submit calls the client made (≈ offered × window when the node keeps up) |
+| accepted / achieved | of those, how many the node took into its ingest queue, and that rate |
+| confirmed committed | of the accepted writes, how many became provable (100% when healthy) |
+| publish→confirm p50/p99/max | **submit → the client first proves the write committed.** Exact percentiles from raw samples; client-observed, so it includes the confirming read's round-trip — an *upper bound* on in-consensus publish→commit, and the number an app feels |
+| errors | `rejected` (node refused — over the per-connection RPC budget), `disconnect` (transport fault), `confirm-timeout` (accepted but never observed within 20 s) |
+
+**Interpreting attempted vs accepted vs rejected.** The RPC limiter is *per
+connection* (a submit costs 16 tokens, refill 128/s ⇒ ~8 submits/s sustained per
+connection, plus a burst). Keep `--rate` under `~8 × --concurrency` and rejects
+stay near zero. Many rejects means you asked for more than the connections'
+budget — raise `--concurrency` to spread the load over more buckets (an operator
+can also raise the node's RPC limits; the public testnet keeps the defaults).
 
 **Loopback-vs-WAN recipe.** Run the local baseline and client-mode-against-`127.0.0.1:8080`
 on a validator host, then client-mode from a *different* host against the same
-node. The p50/p99 gap between the last two is your real client↔committee RTT;
-the submit-rate gap shows how much the WAN path costs versus loopback. Raise
-`--concurrency` (not just `--rate`) for throughput — each connection's submit is
-ack-synchronous, so aggregate throughput scales with connections.
+node, same `--rate`/`--concurrency`. The p50/p99 gap between the last two is your
+real client↔committee RTT; the accepted-rate gap shows what the WAN path costs.
+Raise `--concurrency` (not just `--rate`) for throughput — each connection's
+submit is ack-synchronous, so aggregate throughput scales with connections.
 
 **Safety.** Duration defaults to a short **10 s** so a bare `--against` command
 cannot accidentally hammer a live node; ask for longer runs explicitly with
